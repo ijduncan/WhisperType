@@ -1,0 +1,14 @@
+# Python virtual environment
+.venv/
+__pycache__/
+*.pyc
+
+# Bundled Whisper model (1.5 GB) — regenerate with the command in the README
+models/
+
+# Build output
+build/
+dist/
+
+# User runtime config (defaults live in whispertype.py)
+config.json

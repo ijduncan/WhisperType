@@ -1,0 +1,12 @@
+faster-whisper==1.1.1
+sounddevice==0.5.1
+numpy==2.1.3
+keyboard==0.13.5
+pyperclip==1.9.0
+pystray==0.19.5
+pillow==11.1.0
+requests==2.34.2
+
+# GPU acceleration (NVIDIA CUDA 12). Remove these two lines for a CPU-only install.
+nvidia-cublas-cu12==12.9.2.10
+nvidia-cudnn-cu12==9.25.0.15
