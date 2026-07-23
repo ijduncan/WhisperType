@@ -117,3 +117,7 @@ You can also toggle auto-paste from the tray icon's right-click menu.
   faster results with slightly lower accuracy.
 - The `keyboard` library captures a global hotkey; if the hotkey ever doesn't
   register, try running `run.bat` as administrator.
+
+## License
+
+Released under the [MIT License](LICENSE).
