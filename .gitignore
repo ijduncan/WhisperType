@@ -3,8 +3,10 @@
 __pycache__/
 *.pyc
 
-# Bundled Whisper model (1.5 GB) — regenerate with the command in the README
+# Components fetched by --fetch / bundled into a build. Running the app from
+# source puts these in the repo folder, and they are gigabytes each.
 models/
+nvidia/
 
 # Build output
 build/

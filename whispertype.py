@@ -97,13 +97,37 @@ def _register_cuda_dlls():
         print(f"[cuda] Could not register CUDA DLL dirs: {e}")
 
 
-def _resolve_model(name):
-    """Prefer a locally-present model (downloaded at install time, or bundled)
-    over fetching by name from Hugging Face."""
+def _local_models():
+    """Every model present on disk, as {name: path}."""
+    found = {}
     for root in (_data_dir(), _bundle_dir()):
-        local = os.path.join(root, "models", name)
-        if os.path.isdir(local) and os.path.isfile(os.path.join(local, "model.bin")):
-            return local
+        mdir = os.path.join(root, "models")
+        if not os.path.isdir(mdir):
+            continue
+        for n in os.listdir(mdir):
+            p = os.path.join(mdir, n)
+            if n not in found and os.path.isfile(os.path.join(p, "model.bin")):
+                found[n] = p
+    return found
+
+
+def _resolve_model(name):
+    """Prefer a locally-present model over downloading from Hugging Face.
+
+    If the configured model isn't installed but another one is, use that —
+    otherwise the app sits on 'loading' silently pulling gigabytes, which
+    looks like a hang.
+    """
+    local = _local_models()
+    if name in local:
+        return local[name]
+    if local:
+        alt = sorted(local)[0]
+        print(f"[model] '{name}' is not installed; using '{alt}' instead. "
+              f"Installed: {sorted(local)}")
+        return local[alt]
+    print(f"[model] '{name}' is not installed locally — downloading from "
+          f"Hugging Face, which can take several minutes.")
     return name
 
 DEFAULT_CONFIG = {
@@ -123,10 +147,18 @@ def load_config():
     cfg = dict(DEFAULT_CONFIG)
     if os.path.exists(CONFIG_PATH):
         try:
-            with open(CONFIG_PATH, "r", encoding="utf-8") as f:
+            # utf-8-sig so a BOM (Notepad, PowerShell Set-Content) doesn't make
+            # the file unreadable and silently reset every setting.
+            with open(CONFIG_PATH, "r", encoding="utf-8-sig") as f:
                 cfg.update(json.load(f))
         except Exception as e:
             print(f"[config] Could not read config.json ({e}); using defaults.")
+            try:
+                bad = CONFIG_PATH + ".bad"
+                os.replace(CONFIG_PATH, bad)
+                print(f"[config] Kept the unreadable file as {bad}")
+            except Exception:
+                pass
     # Write back so the user has a complete file to edit.
     try:
         with open(CONFIG_PATH, "w", encoding="utf-8") as f:
@@ -152,6 +184,7 @@ ICONS = {
     "idle": _icon((40, 120, 220, 255)),        # blue
     "recording": _icon((220, 50, 50, 255)),    # red
     "working": _icon((230, 150, 30, 255)),     # orange
+    "error": _icon((120, 40, 140, 255)),       # purple
 }
 
 
@@ -358,6 +391,7 @@ class WhisperType:
         self._settings_open = False
         self.ui = UiThread()
         self.overlay = Overlay(self.ui)
+        self.load_error = None
 
     # -- config -------------------------------------------------------------
     def save_config(self):
@@ -396,6 +430,16 @@ class WhisperType:
                 pass
 
     # -- model --------------------------------------------------------------
+    def _load_model_guarded(self):
+        """Never leave the tray stuck on 'loading' if the model can't load."""
+        try:
+            self.load_model()
+        except Exception as e:
+            import traceback
+            traceback.print_exc()
+            self.load_error = str(e)
+            self.set_state("error")
+
     def load_model(self):
         _register_cuda_dlls()
         from faster_whisper import WhisperModel
@@ -546,7 +590,11 @@ class WhisperType:
 
     def build_menu(self):
         return pystray.Menu(
-            pystray.MenuItem(lambda item: f"Status: {self.state}", None, enabled=False),
+            pystray.MenuItem(
+                lambda item: (f"Error: {self.load_error[:60]}" if self.load_error
+                              else f"Status: {self.state}"),
+                None, enabled=False),
+            pystray.MenuItem(lambda item: f"Model: {self.cfg['model']}", None, enabled=False),
             pystray.MenuItem(lambda item: f"Hotkey: {self.cfg['hotkey']}", None, enabled=False),
             pystray.Menu.SEPARATOR,
             pystray.MenuItem(
@@ -717,7 +765,7 @@ class WhisperType:
               f"(output: {self.cfg['output_mode']})")
 
         # Load the model in the background so the tray appears immediately.
-        threading.Thread(target=self.load_model, daemon=True).start()
+        threading.Thread(target=self._load_model_guarded, daemon=True).start()
 
         self.icon = pystray.Icon(
             "WhisperType", ICONS["loading"], "WhisperType — loading", self.build_menu()
@@ -768,11 +816,12 @@ MODELS = {
     "large-v3":  ("Systran/faster-whisper-large-v3",  "~3.1 GB"),
 }
 
-# Immutable PyPI wheels holding the CUDA runtime libraries CTranslate2 needs.
+# Immutable PyPI wheels holding the CUDA runtime libraries CTranslate2 needs,
+# with a sentinel DLL used to tell whether the wheel is already unpacked.
 CUDA_WHEELS = [
-    ("nvidia-cublas-cu12", "12.9.2.10"),
-    ("nvidia-cudnn-cu12", "9.25.0.15"),
-    ("nvidia-cuda-nvrtc-cu12", "12.9.86"),
+    ("nvidia-cublas-cu12", "12.9.2.10", "cublas/bin/cublas64_12.dll"),
+    ("nvidia-cudnn-cu12", "9.25.0.15", "cudnn/bin/cudnn64_9.dll"),
+    ("nvidia-cuda-nvrtc-cu12", "12.9.86", "cuda_nvrtc/bin/nvrtc64_120_0.dll"),
 ]
 
 
@@ -821,7 +870,10 @@ def fetch_cuda(dest_root):
     out = os.path.join(dest_root, "nvidia")
     os.makedirs(out, exist_ok=True)
     with tempfile.TemporaryDirectory() as td:
-        for pkg, ver in CUDA_WHEELS:
+        for pkg, ver, sentinel in CUDA_WHEELS:
+            if os.path.isfile(os.path.join(out, *sentinel.split("/"))):
+                print(f"[fetch] {pkg} already installed", flush=True)
+                continue
             url, _size = _pypi_wheel_url(pkg, ver)
             whl = os.path.join(td, f"{pkg}-{ver}.whl")
             print(f"[fetch] downloading {pkg} {ver}", flush=True)
@@ -842,28 +894,37 @@ def fetch_cuda(dest_root):
 
 
 def fetch_model(name, dest_root):
-    """Download a faster-whisper model into <dest_root>/models/<name>."""
+    """Download a faster-whisper model into <dest_root>/models/<name>.
+
+    Uses faster_whisper's own downloader rather than a hand-written file list:
+    the required files differ per model (large-v3 ships vocabulary.json where
+    medium.en ships vocabulary.txt), and getting that wrong produces a model
+    directory that fails to load with "Cannot load the vocabulary".
+    """
     if name not in MODELS:
         raise SystemExit(f"unknown model '{name}' (choose from {list(MODELS)})")
-    repo, _size = MODELS[name]
     out = os.path.join(dest_root, "models", name)
     os.makedirs(out, exist_ok=True)
-    base = f"https://huggingface.co/{repo}/resolve/main/"
-    files = ["config.json", "tokenizer.json", "vocabulary.txt", "model.bin"]
-    for fn in files:
-        target = os.path.join(out, fn)
-        if os.path.isfile(target) and fn != "model.bin":
-            continue
-        print(f"[fetch] downloading {name}/{fn}", flush=True)
-        try:
-            _download(base + fn, target, label=fn)
-        except Exception as e:
-            # vocabulary.txt is absent for some repos; tokenizer covers it.
-            if fn in ("vocabulary.txt", "tokenizer.json"):
-                print(f"[fetch] skip {fn} ({e})", flush=True)
-                continue
-            raise
+    print(f"[fetch] downloading model '{name}' (this can take a few minutes)",
+          flush=True)
+    from faster_whisper import download_model
+    download_model(name, output_dir=out)
+    _verify_model(out, name)
     print(f"[fetch] model '{name}' ready in {out}", flush=True)
+
+
+def _verify_model(path, name):
+    """Fail loudly if a model directory is missing what CTranslate2 needs."""
+    if not os.path.isfile(os.path.join(path, "model.bin")):
+        raise RuntimeError(f"model '{name}' is missing model.bin")
+    have_vocab = any(
+        os.path.isfile(os.path.join(path, f))
+        for f in ("vocabulary.json", "vocabulary.txt", "tokenizer.json")
+    )
+    if not have_vocab:
+        raise RuntimeError(
+            f"model '{name}' has no vocabulary/tokenizer file — it would fail "
+            f"to load")
 
 
 def fetch_main(argv):
@@ -876,18 +937,27 @@ def fetch_main(argv):
         i = argv.index("--model")
         if i + 1 < len(argv):
             model = argv[i + 1]
+    print(f"[fetch] data dir : {dest}", flush=True)
+    print(f"[fetch] config   : {CONFIG_PATH}", flush=True)
+    print(f"[fetch] model={model} cuda={want_cuda}", flush=True)
     try:
         if want_cuda:
             fetch_cuda(dest)
         if model and model.lower() != "none":
             fetch_model(model, dest)
-            # Record the choice so the app uses it on first launch.
-            cfg = load_config()
+        # Record the choice so the app uses it on first launch. Done even if
+        # only CUDA was requested, so device/compute_type stay consistent.
+        cfg = load_config()
+        if model and model.lower() != "none":
             cfg["model"] = model
-            if not want_cuda:
-                cfg["device"], cfg["compute_type"] = "cpu", "int8"
-            with open(CONFIG_PATH, "w", encoding="utf-8") as f:
-                json.dump(cfg, f, indent=2)
+        if want_cuda:
+            cfg["device"], cfg["compute_type"] = "cuda", "float16"
+        else:
+            cfg["device"], cfg["compute_type"] = "cpu", "int8"
+        with open(CONFIG_PATH, "w", encoding="utf-8") as f:
+            json.dump(cfg, f, indent=2)
+        print(f"[fetch] wrote config: model={cfg['model']} device={cfg['device']}",
+              flush=True)
         print("[fetch] DONE", flush=True)
         return 0
     except Exception:
