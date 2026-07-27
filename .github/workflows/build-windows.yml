@@ -79,4 +79,18 @@ jobs:
         if: startsWith(github.ref, 'refs/tags/v')
         env:
           GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
-        run: gh release upload "${{ github.ref_name }}" "${{ github.workspace }}\out\WhisperType-Setup.exe" --clobber
+        run: |
+          $tag = "${{ github.ref_name }}"
+          # A release may already exist (created by hand with full notes). If
+          # not, create one from the tag - "gh release upload" alone fails when
+          # the release does not exist yet.
+          gh release view $tag *> $null
+          if ($LASTEXITCODE -ne 0) {
+            Write-Host "No release for $tag yet - creating one."
+            gh release create $tag --title "WhisperType $($tag.TrimStart('v'))" --generate-notes
+            if ($LASTEXITCODE -ne 0) { throw "could not create release $tag" }
+          } else {
+            Write-Host "Release $tag already exists - uploading into it."
+          }
+          gh release upload $tag "${{ github.workspace }}\out\WhisperType-Setup.exe" --clobber
+          if ($LASTEXITCODE -ne 0) { throw "could not upload installer to $tag" }
