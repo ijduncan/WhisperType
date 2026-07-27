@@ -23,6 +23,21 @@ from PIL import Image, ImageDraw
 APP_DIR = os.path.dirname(os.path.abspath(__file__))
 
 
+def _data_dir():
+    """Writable per-user folder for components fetched after install
+    (models, CUDA libraries). Survives upgrades and needs no admin rights."""
+    if getattr(sys, "frozen", False):
+        base = os.environ.get("LOCALAPPDATA") or os.environ.get("APPDATA") or APP_DIR
+        d = os.path.join(base, "WhisperType")
+    else:
+        d = APP_DIR
+    try:
+        os.makedirs(d, exist_ok=True)
+    except Exception:
+        pass
+    return d
+
+
 def _config_path():
     """Config lives next to the script when running from source, but in a
     writable per-user folder when installed (Program Files is read-only)."""
@@ -45,8 +60,9 @@ def _bundle_dir():
 
 
 def _nvidia_roots():
-    roots = []
-    # Frozen bundle: DLLs collected under <bundle>/nvidia/<lib>/bin
+    """Places CUDA DLLs may live, most-specific first: downloaded at install
+    time, bundled in the package, or pip-installed in the dev venv."""
+    roots = [os.path.join(_data_dir(), "nvidia")]
     if getattr(sys, "frozen", False):
         roots.append(os.path.join(_bundle_dir(), "nvidia"))
     else:
@@ -82,11 +98,12 @@ def _register_cuda_dlls():
 
 
 def _resolve_model(name):
-    """Prefer a model bundled next to the app (offline) over the HF cache /
-    download by name."""
-    local = os.path.join(_bundle_dir(), "models", name)
-    if os.path.isdir(local):
-        return local
+    """Prefer a locally-present model (downloaded at install time, or bundled)
+    over fetching by name from Hugging Face."""
+    for root in (_data_dir(), _bundle_dir()):
+        local = os.path.join(root, "models", name)
+        if os.path.isdir(local) and os.path.isfile(os.path.join(local, "model.bin")):
+            return local
     return name
 
 DEFAULT_CONFIG = {
@@ -739,6 +756,146 @@ def selftest():
         sys.exit(1)
 
 
+# ---------------------------------------------------------------------------
+# Component downloader — used by the installer to fetch the model and the
+# optional GPU libraries, so the installer itself stays small.
+# ---------------------------------------------------------------------------
+
+MODELS = {
+    "base.en":   ("Systran/faster-whisper-base.en",   "~150 MB"),
+    "small.en":  ("Systran/faster-whisper-small.en",  "~490 MB"),
+    "medium.en": ("Systran/faster-whisper-medium.en", "~1.5 GB"),
+    "large-v3":  ("Systran/faster-whisper-large-v3",  "~3.1 GB"),
+}
+
+# Immutable PyPI wheels holding the CUDA runtime libraries CTranslate2 needs.
+CUDA_WHEELS = [
+    ("nvidia-cublas-cu12", "12.9.2.10"),
+    ("nvidia-cudnn-cu12", "9.25.0.15"),
+    ("nvidia-cuda-nvrtc-cu12", "12.9.86"),
+]
+
+
+def _pypi_wheel_url(package, version):
+    """Resolve the win_amd64 wheel URL for an exact package version."""
+    import json as _json
+    import urllib.request
+    url = f"https://pypi.org/pypi/{package}/{version}/json"
+    with urllib.request.urlopen(url, timeout=60) as r:
+        data = _json.loads(r.read().decode("utf-8"))
+    for f in data["urls"]:
+        name = f.get("filename", "")
+        if name.endswith(".whl") and "win_amd64" in name:
+            return f["url"], f.get("size", 0)
+    raise RuntimeError(f"no win_amd64 wheel for {package}=={version}")
+
+
+def _download(url, dest, label=""):
+    """Stream a URL to disk, reporting progress on stdout."""
+    import urllib.request
+    tmp = dest + ".part"
+    with urllib.request.urlopen(url, timeout=120) as r:
+        total = int(r.headers.get("Content-Length") or 0)
+        done = 0
+        last = -1
+        with open(tmp, "wb") as f:
+            while True:
+                chunk = r.read(1024 * 256)
+                if not chunk:
+                    break
+                f.write(chunk)
+                done += len(chunk)
+                if total:
+                    pct = int(done * 100 / total)
+                    if pct != last and pct % 2 == 0:
+                        last = pct
+                        print(f"[fetch] {label} {pct}%", flush=True)
+    os.replace(tmp, dest)
+    return dest
+
+
+def fetch_cuda(dest_root):
+    """Download + unpack the CUDA DLLs into <dest_root>/nvidia/<lib>/bin."""
+    import tempfile
+    import zipfile
+    out = os.path.join(dest_root, "nvidia")
+    os.makedirs(out, exist_ok=True)
+    with tempfile.TemporaryDirectory() as td:
+        for pkg, ver in CUDA_WHEELS:
+            url, _size = _pypi_wheel_url(pkg, ver)
+            whl = os.path.join(td, f"{pkg}-{ver}.whl")
+            print(f"[fetch] downloading {pkg} {ver}", flush=True)
+            _download(url, whl, label=pkg)
+            print(f"[fetch] extracting {pkg}", flush=True)
+            with zipfile.ZipFile(whl) as z:
+                for m in z.namelist():
+                    # keep only nvidia/<lib>/bin/*.dll
+                    parts = m.split("/")
+                    if (len(parts) >= 4 and parts[0] == "nvidia"
+                            and parts[2] == "bin" and m.lower().endswith(".dll")):
+                        target = os.path.join(out, parts[1], "bin", parts[3])
+                        os.makedirs(os.path.dirname(target), exist_ok=True)
+                        with z.open(m) as src, open(target, "wb") as dst:
+                            dst.write(src.read())
+            os.remove(whl)
+    print(f"[fetch] CUDA libraries ready in {out}", flush=True)
+
+
+def fetch_model(name, dest_root):
+    """Download a faster-whisper model into <dest_root>/models/<name>."""
+    if name not in MODELS:
+        raise SystemExit(f"unknown model '{name}' (choose from {list(MODELS)})")
+    repo, _size = MODELS[name]
+    out = os.path.join(dest_root, "models", name)
+    os.makedirs(out, exist_ok=True)
+    base = f"https://huggingface.co/{repo}/resolve/main/"
+    files = ["config.json", "tokenizer.json", "vocabulary.txt", "model.bin"]
+    for fn in files:
+        target = os.path.join(out, fn)
+        if os.path.isfile(target) and fn != "model.bin":
+            continue
+        print(f"[fetch] downloading {name}/{fn}", flush=True)
+        try:
+            _download(base + fn, target, label=fn)
+        except Exception as e:
+            # vocabulary.txt is absent for some repos; tokenizer covers it.
+            if fn in ("vocabulary.txt", "tokenizer.json"):
+                print(f"[fetch] skip {fn} ({e})", flush=True)
+                continue
+            raise
+    print(f"[fetch] model '{name}' ready in {out}", flush=True)
+
+
+def fetch_main(argv):
+    """`--fetch [--model NAME] [--cuda]` — used by the installer."""
+    import traceback
+    dest = _data_dir()
+    model = None
+    want_cuda = "--cuda" in argv
+    if "--model" in argv:
+        i = argv.index("--model")
+        if i + 1 < len(argv):
+            model = argv[i + 1]
+    try:
+        if want_cuda:
+            fetch_cuda(dest)
+        if model and model.lower() != "none":
+            fetch_model(model, dest)
+            # Record the choice so the app uses it on first launch.
+            cfg = load_config()
+            cfg["model"] = model
+            if not want_cuda:
+                cfg["device"], cfg["compute_type"] = "cpu", "int8"
+            with open(CONFIG_PATH, "w", encoding="utf-8") as f:
+                json.dump(cfg, f, indent=2)
+        print("[fetch] DONE", flush=True)
+        return 0
+    except Exception:
+        traceback.print_exc()
+        print("[fetch] FAILED", flush=True)
+        return 1
+
+
 def overlaytest(seconds=4.0):
     """Show the overlay with simulated levels — verifies the panel works in a
     frozen build (Tk + win32 styling) without needing the mic or hotkey."""
@@ -792,6 +949,8 @@ def overlaytest(seconds=4.0):
 
 
 def main():
+    if "--fetch" in sys.argv:
+        sys.exit(fetch_main(sys.argv))
     if "--overlaytest" in sys.argv:
         overlaytest()
         return

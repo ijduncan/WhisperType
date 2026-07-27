@@ -7,12 +7,23 @@ similar to Windows dictation (Win+H) — but offline, powered by
 
 ## Download
 
-**[⬇️ Download the Windows installer (Google Drive, ~2.3 GB)](https://drive.google.com/file/d/1at1otQpeNee90Rez587gc_9DLl__SVr4/view?usp=drive_link)**
+**[⬇️ Download the Windows installer (~75 MB)](https://github.com/ijduncan/WhisperType/releases/latest)**
 
-The installer needs no Python and bundles GPU support and the `medium.en` model,
-so it works fully offline from the first launch. It installs per-user (no admin
-prompt) and offers a "start at sign-in" option. Because the `.exe` is unsigned,
-Windows SmartScreen may warn on first run — click *More info → Run anyway*.
+The installer needs no Python. During setup you pick which **speech model** to
+install and whether to add **GPU acceleration**, and it downloads just those:
+
+| Choice | Download |
+|--------|----------|
+| `base.en` — fastest, least accurate | ~150 MB |
+| `small.en` — fast, good accuracy | ~490 MB |
+| `medium.en` — slower, very accurate *(default)* | ~1.5 GB |
+| `large-v3` — best accuracy, multilingual | ~3.1 GB |
+| GPU acceleration (NVIDIA only) | +~1.4 GB |
+
+Internet is needed **during installation only** — afterwards WhisperType runs
+entirely offline. It installs per-user (no admin prompt) and offers a "start at
+sign-in" option. Because the `.exe` is unsigned, Windows SmartScreen may warn on
+first run — click *More info → Run anyway*.
 
 Prefer to build it yourself, or run without installing? See
 [Running from source](#running-from-source) and
@@ -77,24 +88,39 @@ automatically if GPU init fails).
 
 ## Building the installer
 
-The app can be packaged into a single Windows installer
-(`WhisperType-Setup.exe`) that needs no Python and bundles the GPU libraries and
-the `medium.en` model, so it works offline from first launch.
+The app can be packaged into a Windows installer (`WhisperType-Setup.exe`) that
+needs no Python.
 
 1. Complete [Running from source](#running-from-source) first (the build reuses
    the `.venv`).
 2. Install the build tools once:
    - `.venv\Scripts\python.exe -m pip install pyinstaller`
    - `winget install JRSoftware.InnoSetup`
-3. Fetch the model to bundle (it's git-ignored, so a fresh clone won't have it):
-   ```
-   .venv\Scripts\python -c "from faster_whisper import download_model; download_model('medium.en', output_dir=r'models/medium.en')"
-   ```
-4. Run **`build_installer.bat`**. It runs PyInstaller then Inno Setup and writes
+3. Run **`build_installer.bat`**. It runs PyInstaller then Inno Setup and writes
    the installer to `C:\WhisperTypeBuild\Output\WhisperType-Setup.exe`.
 
+That produces the **slim** installer (~75 MB): the model and CUDA libraries are
+downloaded during installation by `WhisperTypeFetch.exe`, based on what the user
+picks in the setup wizard.
+
+To build a **fully offline** installer instead (~2.3 GB, nothing downloaded),
+run `build_installer.bat bundled`. It sets `WHISPERTYPE_BUNDLE=1`, which makes
+`whispertype.spec` embed the model and the CUDA DLLs.
+
 The build outputs to `C:\WhisperTypeBuild` (outside OneDrive) on purpose —
-OneDrive locks files mid-build and also would try to sync the ~3 GB output.
+OneDrive locks files mid-build and would try to sync the output.
+
+### Fetching components manually
+
+`WhisperTypeFetch.exe` (or `python whispertype.py`) accepts:
+
+```
+WhisperTypeFetch.exe --fetch --model medium.en --cuda
+```
+
+It downloads into `%LOCALAPPDATA%\WhisperType\` — `models\<name>\` for models and
+`nvidia\<lib>\bin\` for the CUDA DLLs. The app prefers those over anything
+bundled, so you can add or swap models on an installed copy.
 
 The installer installs per-user (no admin prompt), adds Start Menu / optional
 desktop shortcuts, and offers a **"Start WhisperType automatically when I sign
