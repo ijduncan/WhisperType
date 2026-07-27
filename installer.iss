@@ -3,7 +3,7 @@
 ; libraries are downloaded during installation, so the installer stays small.
 
 #define MyAppName "WhisperType"
-#define MyAppVersion "1.1.1"
+#define MyAppVersion "1.2.0"
 #define MyAppPublisher "WhisperType"
 #define MyAppExeName "WhisperType.exe"
 #define MyFetchExeName "WhisperTypeFetch.exe"

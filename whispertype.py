@@ -440,6 +440,15 @@ class WhisperType:
             self.load_error = str(e)
             self.set_state("error")
 
+    def reload_model(self):
+        """Swap to the model/device currently in cfg, without restarting."""
+        self.load_error = None
+        self.set_state("loading")
+        old = self.model
+        self.model = None
+        del old
+        self._load_model_guarded()
+
     def load_model(self):
         _register_cuda_dlls()
         from faster_whisper import WhisperModel
@@ -663,31 +672,68 @@ class WhisperType:
                 frm, text="e.g. ctrl+alt+windows+space", foreground="#777"
             ).grid(row=2, column=0, columnspan=2, sticky="w", pady=(2, 10))
 
+            # --- Speech model ---
+            installed = _local_models()
+
+            def model_label(name):
+                note = MODEL_NOTES.get(name, "")
+                status = ("installed" if name in installed
+                          else f"download {_human_mb(MODELS[name][1])}")
+                return f"{name} — {note} ({status})"
+
+            model_names = list(MODELS)
+            labels = [model_label(n) for n in model_names]
+            ttk.Label(frm, text="Speech model").grid(row=3, column=0, sticky="w")
+            model_var = tk.StringVar(
+                value=model_label(self.cfg["model"])
+                if self.cfg["model"] in MODELS else labels[0])
+            ttk.Combobox(
+                frm, textvariable=model_var, state="readonly", width=50,
+                values=labels,
+            ).grid(row=4, column=0, columnspan=2, sticky="we", pady=(2, 10))
+
+            # --- Acceleration ---
+            gpu_ready = cuda_installed()
+            gpu_label = ("GPU — NVIDIA (installed)" if gpu_ready
+                         else f"GPU — NVIDIA (download {_human_mb(CUDA_MB)})")
+            cpu_label = "CPU — works everywhere, slower"
+            ttk.Label(frm, text="Acceleration").grid(row=5, column=0, sticky="w")
+            accel_var = tk.StringVar(
+                value=gpu_label if self.cfg["device"] == "cuda" else cpu_label)
+            ttk.Combobox(
+                frm, textvariable=accel_var, state="readonly", width=50,
+                values=[gpu_label, cpu_label],
+            ).grid(row=6, column=0, columnspan=2, sticky="we", pady=(2, 10))
+
             # --- Output mode ---
-            ttk.Label(frm, text="Output").grid(row=3, column=0, sticky="w")
+            ttk.Label(frm, text="Output").grid(row=7, column=0, sticky="w")
             output_var = tk.StringVar(value=self.cfg["output_mode"])
             ttk.Combobox(
                 frm, textvariable=output_var, state="readonly", width=26,
                 values=["paste", "clipboard"],
-            ).grid(row=4, column=0, columnspan=2, sticky="we", pady=(2, 10))
+            ).grid(row=8, column=0, columnspan=2, sticky="we", pady=(2, 10))
 
             # --- Language ---
             ttk.Label(frm, text="Language (ISO code, e.g. en)").grid(
-                row=5, column=0, sticky="w")
+                row=9, column=0, sticky="w")
             lang_var = tk.StringVar(value=self.cfg["language"])
             ttk.Entry(frm, textvariable=lang_var, width=28).grid(
-                row=6, column=0, columnspan=2, sticky="we", pady=(2, 10))
+                row=10, column=0, columnspan=2, sticky="we", pady=(2, 10))
 
             # --- Overlay ---
             overlay_var = tk.BooleanVar(value=self.cfg.get("show_overlay", True))
             ttk.Checkbutton(
                 frm, text="Show waveform overlay while recording",
                 variable=overlay_var,
-            ).grid(row=7, column=0, columnspan=2, sticky="w", pady=(0, 14))
+            ).grid(row=11, column=0, columnspan=2, sticky="w", pady=(0, 8))
+
+            # --- Download progress (only shown when something must be fetched) ---
+            prog_label = ttk.Label(frm, text="", foreground="#555")
+            prog_bar = ttk.Progressbar(frm, mode="determinate", maximum=100)
 
             # --- Buttons ---
             btns = ttk.Frame(frm)
-            btns.grid(row=8, column=0, columnspan=2, sticky="e")
+            btns.grid(row=14, column=0, columnspan=2, sticky="e", pady=(6, 0))
 
             def on_save():
                 new_hotkey = hotkey_var.get().strip().lower()
@@ -709,14 +755,89 @@ class WhisperType:
                 self.cfg["show_overlay"] = bool(overlay_var.get())
                 if not self.cfg["show_overlay"]:
                     self.overlay.hide()
-                self.save_config()
-                if self.icon is not None:
+
+                # Model / acceleration may require a download before they apply.
+                new_model = model_names[labels.index(model_var.get())]
+                want_cuda = accel_var.get() == gpu_label
+                model_changed = new_model != self.cfg["model"]
+                device_changed = want_cuda != (self.cfg["device"] == "cuda")
+                needs_dl = (new_model not in _local_models()
+                            or (want_cuda and not cuda_installed()))
+
+                if not (model_changed or device_changed):
+                    self.save_config()
+                    if self.icon is not None:
+                        try:
+                            self.icon.update_menu()
+                        except Exception:
+                            pass
+                    print("[cfg] Settings saved.")
+                    close()
+                    return
+
+                def apply_choice():
+                    self.cfg["model"] = new_model
+                    if want_cuda:
+                        self.cfg["device"] = "cuda"
+                        self.cfg["compute_type"] = "float16"
+                    else:
+                        self.cfg["device"] = "cpu"
+                        self.cfg["compute_type"] = "int8"
+                    self.save_config()
+                    if self.icon is not None:
+                        try:
+                            self.icon.update_menu()
+                        except Exception:
+                            pass
+
+                if not needs_dl:
+                    apply_choice()
+                    print(f"[cfg] Switching to {new_model} on {self.cfg['device']}")
+                    threading.Thread(target=self.reload_model, daemon=True).start()
+                    close()
+                    return
+
+                # Download first, keeping the window open with progress.
+                save_btn.config(state="disabled")
+                cancel_btn.config(state="disabled")
+                prog_label.grid(row=12, column=0, columnspan=2, sticky="w")
+                prog_bar.grid(row=13, column=0, columnspan=2, sticky="we", pady=(4, 0))
+
+                base_text = {"msg": "Preparing…"}
+
+                def set_status(msg):
+                    base_text["msg"] = msg
+                    root.after(0, lambda: prog_label.config(text=msg))
+
+                def set_progress(done, total):
+                    pct = max(0.0, min(100.0, (done / total * 100) if total else 0))
+                    text = f"{base_text['msg']}  {_human_mb(done)} of {_human_mb(total)}"
+                    root.after(0, lambda: (prog_bar.config(value=pct),
+                                           prog_label.config(text=text)))
+
+                def worker():
                     try:
-                        self.icon.update_menu()
-                    except Exception:
-                        pass
-                print("[cfg] Settings saved.")
-                close()
+                        ensure_components(
+                            model=new_model, want_cuda=want_cuda,
+                            on_status=set_status, on_progress=set_progress)
+                    except Exception as e:
+                        import traceback
+                        traceback.print_exc()
+                        root.after(0, lambda: (
+                            messagebox.showerror(
+                                "WhisperType",
+                                f"Could not download the components.\n\n{e}"),
+                            save_btn.config(state="normal"),
+                            cancel_btn.config(state="normal"),
+                            prog_label.grid_remove(),
+                            prog_bar.grid_remove()))
+                        return
+                    apply_choice()
+                    root.after(0, close)
+                    print(f"[cfg] Switching to {new_model} on {self.cfg['device']}")
+                    self.reload_model()
+
+                threading.Thread(target=worker, daemon=True).start()
 
             def close():
                 self._settings_open = False
@@ -725,9 +846,10 @@ class WhisperType:
                 except Exception:
                     pass
 
-            ttk.Button(btns, text="Cancel", command=close).grid(
-                row=0, column=0, padx=(0, 8))
-            ttk.Button(btns, text="Save", command=on_save).grid(row=0, column=1)
+            cancel_btn = ttk.Button(btns, text="Cancel", command=close)
+            cancel_btn.grid(row=0, column=0, padx=(0, 8))
+            save_btn = ttk.Button(btns, text="Save", command=on_save)
+            save_btn.grid(row=0, column=1)
             root.protocol("WM_DELETE_WINDOW", close)
 
             root.update_idletasks()
@@ -809,12 +931,47 @@ def selftest():
 # optional GPU libraries, so the installer itself stays small.
 # ---------------------------------------------------------------------------
 
+# name -> (hugging-face repo, approximate megabytes on disk)
 MODELS = {
-    "base.en":   ("Systran/faster-whisper-base.en",   "~150 MB"),
-    "small.en":  ("Systran/faster-whisper-small.en",  "~490 MB"),
-    "medium.en": ("Systran/faster-whisper-medium.en", "~1.5 GB"),
-    "large-v3":  ("Systran/faster-whisper-large-v3",  "~3.1 GB"),
+    "base.en":   ("Systran/faster-whisper-base.en",    150),
+    "small.en":  ("Systran/faster-whisper-small.en",   490),
+    "medium.en": ("Systran/faster-whisper-medium.en", 1530),
+    "large-v3":  ("Systran/faster-whisper-large-v3",  2950),
 }
+
+MODEL_NOTES = {
+    "base.en":   "fastest, least accurate",
+    "small.en":  "fast, good accuracy",
+    "medium.en": "slower, very accurate",
+    "large-v3":  "best accuracy, multilingual",
+}
+
+# Approximate size of the unpacked CUDA libraries.
+CUDA_MB = 2080
+
+
+def _human_mb(mb):
+    return f"{mb / 1024:.1f} GB" if mb >= 1024 else f"{int(mb)} MB"
+
+
+def _dir_size_mb(path):
+    total = 0
+    for dp, _dn, fn in os.walk(path):
+        for f in fn:
+            try:
+                total += os.path.getsize(os.path.join(dp, f))
+            except OSError:
+                pass
+    return total / (1024 * 1024)
+
+
+def cuda_installed():
+    """True if the CUDA runtime libraries are already unpacked."""
+    for root in _nvidia_roots():
+        if all(os.path.isfile(os.path.join(root, *s.split("/")))
+               for _p, _v, s in CUDA_WHEELS):
+            return True
+    return False
 
 # Immutable PyPI wheels holding the CUDA runtime libraries CTranslate2 needs,
 # with a sentinel DLL used to tell whether the wheel is already unpacked.
@@ -925,6 +1082,54 @@ def _verify_model(path, name):
         raise RuntimeError(
             f"model '{name}' has no vocabulary/tokenizer file — it would fail "
             f"to load")
+
+
+def ensure_components(model=None, want_cuda=False, on_status=None, on_progress=None):
+    """Download whatever is missing for the requested setup.
+
+    on_status(text) and on_progress(done_mb, total_mb) let a GUI show what is
+    happening; progress is estimated by watching the target folder grow, since
+    the underlying downloaders don't expose a byte count.
+    """
+    def status(msg):
+        print(f"[components] {msg}", flush=True)
+        if on_status:
+            on_status(msg)
+
+    dest = _data_dir()
+    jobs = []
+    if want_cuda and not cuda_installed():
+        jobs.append(("cuda", os.path.join(dest, "nvidia"), CUDA_MB))
+    if model and model not in _local_models():
+        if model not in MODELS:
+            raise ValueError(f"unknown model '{model}'")
+        jobs.append((model, os.path.join(dest, "models", model), MODELS[model][1]))
+
+    for kind, path, total_mb in jobs:
+        label = "GPU acceleration files" if kind == "cuda" else f"model '{kind}'"
+        status(f"Downloading {label} ({_human_mb(total_mb)})…")
+        stop = threading.Event()
+
+        def watch(p=path, t=total_mb):
+            while not stop.wait(0.5):
+                if on_progress:
+                    try:
+                        on_progress(_dir_size_mb(p) if os.path.isdir(p) else 0, t)
+                    except Exception:
+                        pass
+
+        watcher = threading.Thread(target=watch, daemon=True)
+        watcher.start()
+        try:
+            if kind == "cuda":
+                fetch_cuda(dest)
+            else:
+                fetch_model(kind, dest)
+        finally:
+            stop.set()
+        if on_progress:
+            on_progress(total_mb, total_mb)
+    status("Ready.")
 
 
 def fetch_main(argv):

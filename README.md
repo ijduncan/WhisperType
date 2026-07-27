@@ -58,10 +58,19 @@ Right-click the tray icon for:
 
 - **Auto-paste into focused app** — toggle between pasting and clipboard-only.
 - **Show waveform overlay** — toggle the recording panel.
-- **Settings…** — a small window to change the **global hotkey** (type a combo or
-  click *Record* and press the keys), the output mode, the language, and the
-  overlay. Hotkey and output changes apply immediately. Settings are saved to
-  `config.json`.
+- **Settings…** — a small window to change:
+  - **Global hotkey** (type a combo, or click *Record* and press the keys)
+  - **Speech model** — switch between `base.en`, `small.en`, `medium.en` and
+    `large-v3`. Each entry shows whether it is installed or how large the
+    download is; picking one that isn't installed downloads it with a progress
+    bar and then swaps to it **without restarting the app**.
+  - **Acceleration** — GPU (NVIDIA) or CPU. Choosing GPU when the CUDA libraries
+    aren't present downloads those too.
+  - Output mode, language, and whether to show the waveform overlay
+
+  So if a model turns out to be too slow, or GPU was chosen on a machine with no
+  NVIDIA card, it can be changed here instead of reinstalling. Settings are
+  saved to `config.json`.
 
 ## Running from source
 
