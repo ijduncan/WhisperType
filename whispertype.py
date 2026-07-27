@@ -739,7 +739,62 @@ def selftest():
         sys.exit(1)
 
 
+def overlaytest(seconds=4.0):
+    """Show the overlay with simulated levels — verifies the panel works in a
+    frozen build (Tk + win32 styling) without needing the mic or hotkey."""
+    import random
+    import tempfile
+    import traceback
+    logp = os.path.join(tempfile.gettempdir(), "whispertype_overlaytest.log")
+
+    def log(msg):
+        print(msg)
+        with open(logp, "a", encoding="utf-8") as f:
+            f.write(msg + "\n")
+
+    open(logp, "w").close()
+    try:
+        log(f"frozen={getattr(sys, 'frozen', False)}")
+        ui = UiThread()
+        ui.start()
+        ov = Overlay(ui)
+        ov.show("Listening")
+        t0 = time.time()
+        while time.time() - t0 < seconds * 0.6:
+            t = time.time() - t0
+            ov.push_level(min(1.0, abs(math.sin(t * 2.2)) * (0.5 + 0.5 * random.random())))
+            time.sleep(0.03)
+        info = {}
+
+        def probe():
+            info["geometry"] = ov.win.geometry()
+            info["mapped"] = bool(ov.win.winfo_ismapped())
+            import ctypes
+            ex = ctypes.windll.user32.GetWindowLongW(int(ov.win.frame(), 16), -20)
+            info["noactivate"] = bool(ex & 0x08000000)
+            info["transparent"] = bool(ex & 0x00000020)
+
+        ui.call(probe)
+        time.sleep(0.6)
+        for k, v in info.items():
+            log(f"  {k} = {v}")
+        ov.set_status("Transcribing…")
+        time.sleep(seconds * 0.4)
+        ov.hide()
+        time.sleep(0.4)
+        ok = info.get("mapped") and info.get("noactivate") and info.get("transparent")
+        log("OVERLAYTEST OK" if ok else "OVERLAYTEST FAILED — window/styles wrong")
+        if not ok:
+            sys.exit(1)
+    except Exception:
+        log("OVERLAYTEST FAILED:\n" + traceback.format_exc())
+        sys.exit(1)
+
+
 def main():
+    if "--overlaytest" in sys.argv:
+        overlaytest()
+        return
     if "--selftest" in sys.argv:
         selftest()
         return
