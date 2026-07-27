@@ -7,6 +7,7 @@ app. No internet is used after the model has been downloaded once.
 """
 
 import json
+import math
 import os
 import sys
 import threading
@@ -95,6 +96,7 @@ DEFAULT_CONFIG = {
     "device": "cuda",              # "cuda" (NVIDIA GPU) or "cpu"
     "compute_type": "float16",     # float16 on GPU; use "int8" on CPU
     "output_mode": "paste",        # "paste" into focused app, or "clipboard" only
+    "show_overlay": True,          # live waveform panel while recording
     "sample_rate": 16000,          # Whisper expects 16 kHz
     "min_seconds": 0.3,            # ignore recordings shorter than this
 }
@@ -136,6 +138,195 @@ ICONS = {
 }
 
 
+# ---------------------------------------------------------------------------
+# Recording overlay: a small always-on-top waveform panel at bottom-center.
+# ---------------------------------------------------------------------------
+
+class Overlay:
+    """Borderless, non-activating panel showing a live mic waveform.
+
+    Runs on the shared Tk UI thread. It must never take focus, or the
+    transcribed text would paste into the overlay's app instead of whatever the
+    user was typing in — hence the WS_EX_NOACTIVATE/TRANSPARENT styles.
+    """
+
+    W, H = 260, 74
+    BARS = 34
+
+    def __init__(self, ui):
+        self.ui = ui              # UiThread
+        self.win = None
+        self.canvas = None
+        self.levels = [0.0] * self.BARS
+        self.status = ""
+        self._visible = False
+        self._anim = None
+        self._phase = 0.0
+
+    # -- win32 window styling ----------------------------------------------
+    def _make_click_through(self):
+        try:
+            import ctypes
+            from ctypes import wintypes
+            hwnd = int(self.win.frame(), 16)
+            GWL_EXSTYLE = -20
+            WS_EX_LAYERED = 0x00080000
+            WS_EX_TRANSPARENT = 0x00000020
+            WS_EX_NOACTIVATE = 0x08000000
+            WS_EX_TOOLWINDOW = 0x00000080
+            u32 = ctypes.windll.user32
+            u32.GetWindowLongW.restype = ctypes.c_long
+            style = u32.GetWindowLongW(hwnd, GWL_EXSTYLE)
+            u32.SetWindowLongW(
+                hwnd, GWL_EXSTYLE,
+                style | WS_EX_LAYERED | WS_EX_TRANSPARENT
+                | WS_EX_NOACTIVATE | WS_EX_TOOLWINDOW,
+            )
+        except Exception as e:
+            print(f"[overlay] could not set click-through styles: {e}")
+
+    def _round_corners(self, radius=16):
+        try:
+            import ctypes
+            hwnd = int(self.win.frame(), 16)
+            g = ctypes.windll.gdi32
+            rgn = g.CreateRoundRectRgn(0, 0, self.W + 1, self.H + 1, radius, radius)
+            ctypes.windll.user32.SetWindowRgn(hwnd, rgn, True)
+        except Exception as e:
+            print(f"[overlay] could not round corners: {e}")
+
+    def _build(self):
+        import tkinter as tk
+        self.win = tk.Toplevel(self.ui.root)
+        self.win.overrideredirect(True)          # no title bar / borders
+        self.win.attributes("-topmost", True)
+        self.win.attributes("-alpha", 0.92)
+        BG = "#14161a"
+        self.win.configure(bg=BG)
+        self.canvas = tk.Canvas(
+            self.win, width=self.W, height=self.H,
+            bg=BG, highlightthickness=0, bd=0,
+        )
+        self.canvas.pack()
+        # Position: bottom-center, a little above the taskbar.
+        sw = self.win.winfo_screenwidth()
+        sh = self.win.winfo_screenheight()
+        x = int((sw - self.W) / 2)
+        y = int(sh - self.H - 96)
+        self.win.geometry(f"{self.W}x{self.H}+{x}+{y}")
+        self.win.withdraw()
+        self.win.update_idletasks()
+        self._make_click_through()
+        self._round_corners()
+
+    # -- drawing ------------------------------------------------------------
+    def _draw(self):
+        c = self.canvas
+        if c is None:
+            return
+        c.delete("all")
+        pad = 14
+        label_h = 18
+        area_top = 8
+        area_h = self.H - label_h - area_top - 8
+        mid = area_top + area_h / 2
+        usable = self.W - pad * 2
+        step = usable / self.BARS
+        bw = max(2, step * 0.55)
+        listening = self.status == "Listening"
+        accent = "#e5484d" if listening else "#f0a020"
+        for i, lv in enumerate(self.levels):
+            if not listening:
+                # Transcribing: bars settle low and a pulse sweeps across, so
+                # the panel reads as "working" rather than frozen.
+                phase = (self._phase - i / self.BARS) % 1.0
+                lv = 0.10 + 0.42 * max(0.0, math.sin(math.pi * phase) ** 8)
+            h = max(2.0, lv * area_h * 0.92)
+            x = pad + i * step + step / 2
+            c.create_rectangle(
+                x - bw / 2, mid - h / 2, x + bw / 2, mid + h / 2,
+                fill=accent, outline="",
+            )
+        c.create_text(
+            self.W / 2, self.H - label_h / 2 - 4,
+            text=self.status, fill="#9aa0a6",
+            font=("Segoe UI", 9),
+        )
+
+    def _tick(self):
+        if not self._visible:
+            return
+        self._phase = (self._phase + 0.035) % 1.0
+        self._draw()
+        self._anim = self.ui.root.after(33, self._tick)   # ~30 fps
+
+    # -- public API (thread-safe: call from anywhere) ----------------------
+    def show(self, status="Listening"):
+        def go():
+            if self.win is None:
+                self._build()
+            self.status = status
+            self.levels = [0.0] * self.BARS
+            self._visible = True
+            self.win.deiconify()
+            self.win.attributes("-topmost", True)
+            self._tick()
+        self.ui.call(go)
+
+    def set_status(self, status):
+        def go():
+            self.status = status
+        self.ui.call(go)
+
+    def push_level(self, level):
+        """Append one amplitude sample (0..1) to the scrolling waveform."""
+        self.levels.append(max(0.0, min(1.0, float(level))))
+        if len(self.levels) > self.BARS:
+            del self.levels[:-self.BARS]
+
+    def hide(self):
+        def go():
+            self._visible = False
+            if self._anim is not None:
+                try:
+                    self.ui.root.after_cancel(self._anim)
+                except Exception:
+                    pass
+                self._anim = None
+            if self.win is not None:
+                self.win.withdraw()
+        self.ui.call(go)
+
+
+class UiThread:
+    """Owns a single hidden Tk root on a dedicated thread, so tkinter work is
+    always marshalled to one place (pystray owns the main thread)."""
+
+    def __init__(self):
+        self.root = None
+        self._ready = threading.Event()
+
+    def start(self):
+        threading.Thread(target=self._run, daemon=True).start()
+        self._ready.wait(timeout=10)
+
+    def _run(self):
+        import tkinter as tk
+        self.root = tk.Tk()
+        self.root.withdraw()
+        self._ready.set()
+        self.root.mainloop()
+
+    def call(self, fn):
+        """Run fn on the UI thread."""
+        if self.root is None:
+            return
+        try:
+            self.root.after(0, fn)
+        except Exception:
+            pass
+
+
 class WhisperType:
     def __init__(self, cfg):
         self.cfg = cfg
@@ -148,6 +339,8 @@ class WhisperType:
         self.icon = None
         self._hotkey_handle = None
         self._settings_open = False
+        self.ui = UiThread()
+        self.overlay = Overlay(self.ui)
 
     # -- config -------------------------------------------------------------
     def save_config(self):
@@ -217,6 +410,10 @@ class WhisperType:
         if status:
             print(f"[audio] {status}", file=sys.stderr)
         self.frames.append(indata.copy())
+        if self.cfg.get("show_overlay", True):
+            # RMS -> perceptual-ish level for the waveform bars.
+            rms = float(np.sqrt(np.mean(np.square(indata)))) if indata.size else 0.0
+            self.overlay.push_level(min(1.0, (rms ** 0.5) * 3.2))
 
     def start_recording(self):
         self.frames = []
@@ -224,11 +421,14 @@ class WhisperType:
             samplerate=self.cfg["sample_rate"],
             channels=1,
             dtype="float32",
+            blocksize=int(self.cfg["sample_rate"] * 0.03),   # ~30 ms per bar
             callback=self._audio_cb,
         )
         self.stream.start()
         self.recording = True
         self.set_state("recording")
+        if self.cfg.get("show_overlay", True):
+            self.overlay.show("Listening")
         print("[rec] Recording… press the hotkey again to stop.")
 
     def stop_recording(self):
@@ -239,6 +439,7 @@ class WhisperType:
         finally:
             self.stream = None
         if not self.frames:
+            self.overlay.hide()
             self.set_state("idle")
             return None
         audio = np.concatenate(self.frames, axis=0).flatten().astype(np.float32)
@@ -246,8 +447,11 @@ class WhisperType:
         print(f"[rec] Stopped ({secs:.1f}s).")
         if secs < self.cfg["min_seconds"]:
             print("[rec] Too short, ignoring.")
+            self.overlay.hide()
             self.set_state("idle")
             return None
+        # Keep the panel up through transcription so the user sees progress.
+        self.overlay.set_status("Transcribing…")
         return audio
 
     # -- transcription ------------------------------------------------------
@@ -255,14 +459,19 @@ class WhisperType:
         self.set_state("working")
         print("[stt] Transcribing…")
         t0 = time.time()
-        segments, _ = self.model.transcribe(
-            audio,
-            language=self.cfg["language"],
-            vad_filter=True,
-            beam_size=5,
-        )
-        text = "".join(s.text for s in segments).strip()
-        print(f"[stt] {time.time() - t0:.1f}s → {text!r}")
+        text = ""
+        try:
+            segments, _ = self.model.transcribe(
+                audio,
+                language=self.cfg["language"],
+                vad_filter=True,
+                beam_size=5,
+            )
+            text = "".join(s.text for s in segments).strip()
+            print(f"[stt] {time.time() - t0:.1f}s → {text!r}")
+        finally:
+            # Always drop the overlay before pasting, so focus/z-order is clean.
+            self.overlay.hide()
         if text:
             self.output(text)
         self.set_state("idle")
@@ -309,7 +518,14 @@ class WhisperType:
         if self._settings_open:
             return
         self._settings_open = True
-        threading.Thread(target=self._run_settings_window, daemon=True).start()
+        self.ui.call(self._run_settings_window)
+
+    def toggle_overlay(self, icon, item):
+        self.cfg["show_overlay"] = not self.cfg.get("show_overlay", True)
+        if not self.cfg["show_overlay"]:
+            self.overlay.hide()
+        self.save_config()
+        print(f"[cfg] show_overlay = {self.cfg['show_overlay']}")
 
     def build_menu(self):
         return pystray.Menu(
@@ -321,6 +537,11 @@ class WhisperType:
                 self.toggle_output_mode,
                 checked=lambda item: self.cfg["output_mode"] == "paste",
             ),
+            pystray.MenuItem(
+                "Show waveform overlay",
+                self.toggle_overlay,
+                checked=lambda item: self.cfg.get("show_overlay", True),
+            ),
             pystray.MenuItem("Settings…", self.open_settings),
             pystray.Menu.SEPARATOR,
             pystray.MenuItem("Quit", self.quit),
@@ -328,11 +549,12 @@ class WhisperType:
 
     # -- settings window ----------------------------------------------------
     def _run_settings_window(self):
+        """Builds the settings window. Must run on the shared UI thread."""
         import tkinter as tk
         from tkinter import ttk, messagebox
 
         try:
-            root = tk.Tk()
+            root = tk.Toplevel(self.ui.root)
             root.title("WhisperType Settings")
             root.resizable(False, False)
             try:
@@ -389,11 +611,18 @@ class WhisperType:
                 row=5, column=0, sticky="w")
             lang_var = tk.StringVar(value=self.cfg["language"])
             ttk.Entry(frm, textvariable=lang_var, width=28).grid(
-                row=6, column=0, columnspan=2, sticky="we", pady=(2, 14))
+                row=6, column=0, columnspan=2, sticky="we", pady=(2, 10))
+
+            # --- Overlay ---
+            overlay_var = tk.BooleanVar(value=self.cfg.get("show_overlay", True))
+            ttk.Checkbutton(
+                frm, text="Show waveform overlay while recording",
+                variable=overlay_var,
+            ).grid(row=7, column=0, columnspan=2, sticky="w", pady=(0, 14))
 
             # --- Buttons ---
             btns = ttk.Frame(frm)
-            btns.grid(row=7, column=0, columnspan=2, sticky="e")
+            btns.grid(row=8, column=0, columnspan=2, sticky="e")
 
             def on_save():
                 new_hotkey = hotkey_var.get().strip().lower()
@@ -412,6 +641,9 @@ class WhisperType:
                     self.apply_hotkey(new_hotkey)
                 self.cfg["output_mode"] = output_var.get()
                 self.cfg["language"] = lang_var.get().strip() or "en"
+                self.cfg["show_overlay"] = bool(overlay_var.get())
+                if not self.cfg["show_overlay"]:
+                    self.overlay.hide()
                 self.save_config()
                 if self.icon is not None:
                     try:
@@ -419,21 +651,33 @@ class WhisperType:
                     except Exception:
                         pass
                 print("[cfg] Settings saved.")
-                root.destroy()
+                close()
 
-            ttk.Button(btns, text="Cancel", command=root.destroy).grid(
+            def close():
+                self._settings_open = False
+                try:
+                    root.destroy()
+                except Exception:
+                    pass
+
+            ttk.Button(btns, text="Cancel", command=close).grid(
                 row=0, column=0, padx=(0, 8))
             ttk.Button(btns, text="Save", command=on_save).grid(row=0, column=1)
+            root.protocol("WM_DELETE_WINDOW", close)
 
             root.update_idletasks()
-            root.eval("tk::PlaceWindow . center")
+            # Center on screen (Toplevel: compute manually).
+            w, h = root.winfo_width(), root.winfo_height()
+            x = (root.winfo_screenwidth() - w) // 2
+            y = (root.winfo_screenheight() - h) // 2
+            root.geometry(f"+{x}+{y}")
             root.attributes("-topmost", True)
             root.after(100, lambda: root.attributes("-topmost", False))
+            root.lift()
+            root.focus_force()
             hk_entry.focus_set()
-            root.mainloop()
         except Exception as e:
             print(f"[settings] error: {e}")
-        finally:
             self._settings_open = False
 
     def quit(self, icon, item):
@@ -447,6 +691,9 @@ class WhisperType:
         os._exit(0)
 
     def run(self):
+        # Single Tk thread shared by the overlay and the settings window.
+        self.ui.start()
+
         # Register the global hotkey (tracks the handle for live re-binding).
         self._hotkey_handle = keyboard.add_hotkey(self.cfg["hotkey"], self.on_hotkey)
         print(f"[ready] Hotkey: {self.cfg['hotkey']}  "

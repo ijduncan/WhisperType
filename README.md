@@ -21,9 +21,16 @@ Prefer to build it yourself, or run without installing? See
 ## How it works
 
 1. Press the global hotkey (**Ctrl+Alt+Win+Space** by default) to start recording.
+   A small **waveform panel** appears at the bottom of the screen, showing your
+   voice live so you can see it's listening.
 2. Speak.
-3. Press the hotkey again to stop. Your speech is transcribed locally and
-   **pasted into whatever app is focused** (or copied to the clipboard).
+3. Press the hotkey again to stop. The panel switches to a "Transcribing…" pulse
+   while your speech is transcribed locally, then the text is **pasted into
+   whatever app is focused** (or copied to the clipboard).
+
+The overlay never takes keyboard focus and is click-through, so it can't
+interfere with the app you're typing into. Turn it off from the tray menu or
+Settings if you'd rather just have the tray dot.
 
 The tray icon shows the current state:
 
@@ -39,9 +46,11 @@ The tray icon shows the current state:
 Right-click the tray icon for:
 
 - **Auto-paste into focused app** — toggle between pasting and clipboard-only.
+- **Show waveform overlay** — toggle the recording panel.
 - **Settings…** — a small window to change the **global hotkey** (type a combo or
-  click *Record* and press the keys), the output mode, and the language. Hotkey
-  and output changes apply immediately. Settings are saved to `config.json`.
+  click *Record* and press the keys), the output mode, the language, and the
+  overlay. Hotkey and output changes apply immediately. Settings are saved to
+  `config.json`.
 
 ## Running from source
 
@@ -103,6 +112,7 @@ Edit **`config.json`** (created on first run):
 | `device`       | `cuda`             | `cuda` uses your NVIDIA GPU; set to `cpu` if you don't have one. |
 | `compute_type` | `float16`          | `float16` on GPU; use `int8` on CPU. |
 | `output_mode`  | `paste`            | `paste` into focused app, or `clipboard` only. |
+| `show_overlay` | `true`             | Live waveform panel while recording. |
 
 You can also toggle auto-paste from the tray icon's right-click menu.
 
