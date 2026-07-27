@@ -76,11 +76,11 @@ Right-click the tray icon for:
 
 Requires **Python 3.12** (64-bit) and, for GPU, an NVIDIA GPU with a recent
 driver. The CUDA cuBLAS/cuDNN libraries are installed as pip packages
-(see `requirements.txt`) — no separate CUDA Toolkit needed.
+(`requirements-gpu.txt`) — no separate CUDA Toolkit needed.
 
-1. Double-click **`setup.bat`** (or run `python -m venv .venv` and
-   `.venv\Scripts\python -m pip install -r requirements.txt`). This creates a
-   virtual environment and installs the dependencies (a few minutes).
+1. Double-click **`setup.bat`**. This creates a virtual environment and installs
+   `requirements.txt` plus the ~1.3 GB CUDA libraries from
+   `requirements-gpu.txt`. Run `setup.bat cpu` to skip the CUDA download.
 2. Start the app:
    - **`run.bat`** — with a console window (useful to see logs).
    - **`run-hidden.vbs`** — quietly, no console window.
@@ -118,6 +118,26 @@ run `build_installer.bat bundled`. It sets `WHISPERTYPE_BUNDLE=1`, which makes
 
 The build outputs to `C:\WhisperTypeBuild` (outside OneDrive) on purpose —
 OneDrive locks files mid-build and would try to sync the output.
+
+### Automated builds
+
+[`.github/workflows/build-windows.yml`](.github/workflows/build-windows.yml)
+builds the slim installer on GitHub Actions. It runs on pushes to `main`, on
+pull requests, on `v*` tags, and on demand from the Actions tab.
+
+- The built installer is uploaded as a workflow **artifact** on every run.
+- On a **`v*` tag** it is also attached to the matching GitHub Release, so
+  `git tag v1.3.0 && git push --tags` publishes a build.
+- CI installs only `requirements.txt` — not the CUDA libraries — because the
+  slim installer downloads those at install time. It then runs
+  `WhisperTypeFetch.exe --check`, which imports faster-whisper, CTranslate2 and
+  tkinter inside the frozen bundle to catch packaging breakage.
+
+Cross-building is not possible: PyInstaller bundles the host OS's interpreter
+and native libraries, so a macOS or Linux build has to run on that OS (a CI
+runner is enough — you don't need the hardware). The app is currently
+Windows-only in any case: the global hotkey, the clipboard paste, and the
+non-activating overlay window all use Win32 APIs.
 
 ### Fetching components manually
 

@@ -7,6 +7,6 @@ pystray==0.19.5
 pillow==11.1.0
 requests==2.34.2
 
-# GPU acceleration (NVIDIA CUDA 12). Remove these two lines for a CPU-only install.
-nvidia-cublas-cu12==12.9.2.10
-nvidia-cudnn-cu12==9.25.0.15
+# GPU acceleration lives in requirements-gpu.txt. It is ~1.3 GB and is only
+# needed to run from source on a GPU, or to build the bundled installer --
+# the shipped installer downloads those libraries itself.

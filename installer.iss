@@ -11,6 +11,10 @@
 #ifndef DistDir
   #define DistDir "C:\WhisperTypeBuild\slimdist\WhisperType"
 #endif
+; Where the finished installer is written. Overridable with ISCC /DOutDir=...
+#ifndef OutDir
+  #define OutDir "C:\WhisperTypeBuild\Output"
+#endif
 
 [Setup]
 AppId={{9F2A7C4E-1B3D-4E6A-9C88-WHISPERTYPE01}}
@@ -21,7 +25,7 @@ DefaultDirName={localappdata}\Programs\{#MyAppName}
 DefaultGroupName={#MyAppName}
 DisableProgramGroupPage=yes
 PrivilegesRequired=lowest
-OutputDir=C:\WhisperTypeBuild\Output
+OutputDir={#OutDir}
 OutputBaseFilename=WhisperType-Setup
 SetupIconFile=icon.ico
 Compression=lzma2

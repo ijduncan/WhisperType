@@ -1223,7 +1223,38 @@ def overlaytest(seconds=4.0):
         sys.exit(1)
 
 
+def check():
+    """Import the heavy dependencies and report versions, without loading a
+    model or touching the network. Used by CI to catch a frozen build that is
+    missing hidden imports or bundled data files."""
+    import traceback
+    try:
+        print(f"frozen   : {getattr(sys, 'frozen', False)}")
+        print(f"bundle   : {_bundle_dir()}")
+        import ctranslate2
+        print(f"ctranslate2: {ctranslate2.__version__}")
+        import faster_whisper
+        print(f"faster_whisper: {faster_whisper.__version__}")
+        from faster_whisper import WhisperModel  # noqa: F401
+        import sounddevice, pystray, keyboard, pyperclip  # noqa: F401
+        import tkinter
+        from tkinter import ttk  # noqa: F401
+        r = tkinter.Tk(); r.withdraw(); r.destroy()
+        print("tkinter  : ok")
+        import numpy
+        print(f"numpy    : {numpy.__version__}")
+        print(f"models known: {list(MODELS)}")
+        print("CHECK OK")
+        return 0
+    except Exception:
+        traceback.print_exc()
+        print("CHECK FAILED")
+        return 1
+
+
 def main():
+    if "--check" in sys.argv:
+        sys.exit(check())
     if "--fetch" in sys.argv:
         sys.exit(fetch_main(sys.argv))
     if "--overlaytest" in sys.argv:

@@ -1,0 +1,9 @@
+# CUDA 12 runtime libraries for NVIDIA GPU acceleration (~1.3 GB download).
+#
+# Needed only to:
+#   * run from source with "device": "cuda", or
+#   * build the fully-offline installer (build_installer.bat bundled)
+#
+# The shipped slim installer downloads these itself, so CI does not install them.
+nvidia-cublas-cu12==12.9.2.10
+nvidia-cudnn-cu12==9.25.0.15

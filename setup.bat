@@ -13,6 +13,13 @@ echo Installing dependencies (this can take a few minutes)...
 "%~dp0.venv\Scripts\python.exe" -m pip install -r "%~dp0requirements.txt"
 if errorlevel 1 goto :err
 
+echo Installing GPU (CUDA) libraries, about 1.3 GB...
+echo Pass "cpu" to setup.bat to skip this and run on CPU only.
+if /I not "%~1"=="cpu" (
+    "%~dp0.venv\Scripts\python.exe" -m pip install -r "%~dp0requirements-gpu.txt"
+    if errorlevel 1 goto :err
+)
+
 echo.
 echo Setup complete. Double-click run.bat (or run-hidden.vbs) to start WhisperType.
 pause

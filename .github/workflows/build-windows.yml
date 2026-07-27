@@ -1,0 +1,82 @@
+name: Build Windows installer
+
+# Builds the slim installer (the model and CUDA libraries are downloaded by
+# the installer itself, so CI never handles gigabytes).
+#
+#   * push a v* tag  -> builds and attaches WhisperType-Setup.exe to that release
+#   * pull request   -> builds only, to catch breakage
+#   * manual run     -> builds and uploads an artifact you can download
+
+on:
+  push:
+    tags: ["v*"]
+    branches: [main]
+  pull_request:
+    branches: [main]
+  workflow_dispatch:
+
+permissions:
+  contents: write        # needed to upload the asset to a release
+
+jobs:
+  build:
+    runs-on: windows-latest
+
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+          cache: pip
+
+      - name: Install dependencies
+        run: |
+          python -m pip install --upgrade pip
+          pip install -r requirements.txt
+          pip install pyinstaller==6.21.0
+
+      - name: Build app with PyInstaller
+        run: >
+          pyinstaller --noconfirm --clean
+          --distpath "${{ github.workspace }}\dist"
+          --workpath "${{ github.workspace }}\build"
+          whispertype.spec
+
+      - name: Verify the frozen build
+        run: |
+          $dir = "${{ github.workspace }}\dist\WhisperType"
+          foreach ($n in "WhisperType.exe", "WhisperTypeFetch.exe") {
+            if (-not (Test-Path "$dir\$n")) { throw "$n was not produced" }
+          }
+          # Imports faster-whisper / ctranslate2 / tkinter inside the bundle,
+          # which is where a frozen build usually breaks. No model, no network.
+          & "$dir\WhisperTypeFetch.exe" --check
+          if ($LASTEXITCODE -ne 0) { throw "frozen build check failed ($LASTEXITCODE)" }
+
+      - name: Install Inno Setup
+        run: choco install innosetup --no-progress -y
+
+      - name: Build installer
+        run: >
+          & "C:\Program Files (x86)\Inno Setup 6\ISCC.exe"
+          /DDistDir="${{ github.workspace }}\dist\WhisperType"
+          /DOutDir="${{ github.workspace }}\out"
+          installer.iss
+
+      - name: Report installer size
+        run: |
+          $f = Get-Item "${{ github.workspace }}\out\WhisperType-Setup.exe"
+          "{0} - {1:N1} MB" -f $f.Name, ($f.Length / 1MB)
+
+      - uses: actions/upload-artifact@v4
+        with:
+          name: WhisperType-Setup
+          path: out/WhisperType-Setup.exe
+          if-no-files-found: error
+
+      - name: Attach installer to the release
+        if: startsWith(github.ref, 'refs/tags/v')
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: gh release upload "${{ github.ref_name }}" "${{ github.workspace }}\out\WhisperType-Setup.exe" --clobber
