@@ -5,6 +5,27 @@ similar to Windows dictation (Win+H) — but offline, powered by
 [Whisper](https://github.com/openai/whisper) via
 [faster-whisper](https://github.com/SYSTRAN/faster-whisper).
 
+## Screenshots
+
+### Live recording feedback
+
+![WhisperType listening overlay with a live waveform](docs/screenshots/whispertype-listening-overlay.png)
+
+A compact live waveform shows when WhisperType is listening.
+
+### Settings
+
+![WhisperType settings window](docs/screenshots/whispertype-settings.png)
+
+Configure the shortcut, model, GPU acceleration, output mode, language, and
+recording overlay.
+
+### System tray
+
+![WhisperType idle in the Windows system tray](docs/screenshots/whispertype-tray-idle.png)
+
+WhisperType stays ready in the Windows system tray.
+
 ## Download
 
 **[⬇️ Download the Windows installer (~75 MB)](https://github.com/ijduncan/WhisperType/releases/latest)**
