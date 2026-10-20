@@ -537,11 +537,11 @@ class WhisperType:
     def apply_hotkey(self, new_hotkey):
         """Re-register the global hotkey live and persist it."""
         normalized = self.keyboard.validate(new_hotkey)
-        if IS_MACOS and not self.keyboard.request_accessibility(prompt=False):
+        if IS_MACOS and not self.keyboard.request_hotkey_access(prompt=False):
             self.keyboard.unregister(self._hotkey_handle)
             self._hotkey_handle = None
             self.cfg["hotkey"] = normalized
-            self.hotkey_error = "Accessibility permission required for the hotkey"
+            self.hotkey_error = "Accessibility + Input Monitoring needed for the hotkey"
             self.save_config()
             self._refresh_menu()
             self._schedule_accessibility_retry()
@@ -869,10 +869,10 @@ class WhisperType:
             self._accessibility_retry_scheduled = False
             if self._quitting or self._hotkey_handle is not None:
                 return
-            if self.keyboard.request_accessibility(prompt=False):
+            if self.keyboard.request_hotkey_access(prompt=False):
                 self._activate_configured_hotkey()
             else:
-                self.hotkey_error = "Accessibility permission required for the hotkey"
+                self.hotkey_error = "Accessibility + Input Monitoring needed for the hotkey"
                 self._refresh_menu()
                 self._schedule_accessibility_retry()
 
@@ -931,6 +931,10 @@ class WhisperType:
             items.append(pystray.MenuItem(
                 "Accessibility Settings…",
                 lambda icon, item: open_accessibility_settings(),
+            ))
+            items.append(pystray.MenuItem(
+                "Input Monitoring Settings…",
+                lambda icon, item: open_accessibility_settings("input_monitoring"),
             ))
         items.extend([pystray.Menu.SEPARATOR, pystray.MenuItem("Quit", self.quit)])
         return pystray.Menu(*items)
@@ -1231,9 +1235,9 @@ class WhisperType:
         # Register the global hotkey (tracks the handle for live re-binding).
         accessibility_ready = True
         if IS_MACOS:
-            accessibility_ready = self.keyboard.request_accessibility(prompt=True)
+            accessibility_ready = self.keyboard.request_hotkey_access(prompt=True)
         if not accessibility_ready:
-            self.hotkey_error = "Accessibility permission required for the hotkey"
+            self.hotkey_error = "Accessibility + Input Monitoring needed for the hotkey"
         else:
             self._activate_configured_hotkey()
         print(f"[ready] Hotkey: {self.cfg['hotkey']}  "

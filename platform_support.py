@@ -253,6 +253,10 @@ class KeyboardBackend:
         if self.platform_name != "darwin":
             raise RuntimeError(f"unsupported platform: {self.platform_name}")
 
+        if not self.request_input_monitoring(prompt=True):
+            print("[hotkey] Input Monitoring permission required to record a shortcut")
+            return None
+
         from pynput import keyboard
         import pynput._util.darwin as util_darwin
         from Quartz import (
@@ -336,6 +340,33 @@ class KeyboardBackend:
             print(f"[permissions] Could not check Accessibility access: {exc}")
             return False
 
+    def request_input_monitoring(self, prompt: bool = True) -> bool:
+        """Check (and optionally request) Input Monitoring.
+
+        pynput's listeners use a listen-only event tap, which macOS feeds
+        only to apps with Input Monitoring; Accessibility alone is not
+        enough. Requesting it also adds WhisperType to that settings list.
+        """
+        if self.platform_name != "darwin":
+            return True
+        try:
+            from Quartz import CGPreflightListenEventAccess, CGRequestListenEventAccess
+
+            if CGPreflightListenEventAccess():
+                return True
+            if prompt:
+                CGRequestListenEventAccess()
+            return False
+        except Exception as exc:
+            print(f"[permissions] Could not check Input Monitoring access: {exc}")
+            return False
+
+    def request_hotkey_access(self, prompt: bool = True) -> bool:
+        """Accessibility and Input Monitoring, both needed to hear hotkeys."""
+        accessibility = self.request_accessibility(prompt=prompt)
+        input_monitoring = self.request_input_monitoring(prompt=prompt)
+        return accessibility and input_monitoring
+
     def paste(self) -> bool:
         """Send the platform paste shortcut; return False if permission is absent."""
         if self.platform_name == "darwin":
@@ -365,13 +396,14 @@ class KeyboardBackend:
         return True
 
 
-def open_accessibility_settings() -> None:
+def open_accessibility_settings(pane: str = "accessibility") -> None:
     if not IS_MACOS:
         return
     subprocess.Popen(
         [
             "open",
-            "x-apple.systempreferences:com.apple.preference.security?Privacy_Accessibility",
+            "x-apple.systempreferences:com.apple.preference.security?"
+            + ("Privacy_Accessibility" if pane == "accessibility" else "Privacy_ListenEvent"),
         ],
         close_fds=True,
     )
