@@ -7,6 +7,9 @@ machine**, similar to built-in dictation — but offline, powered by
 
 ## Screenshots
 
+These screenshots show the Windows build; macOS provides the same dictation
+workflow from its menu bar.
+
 ### Live recording feedback
 
 ![WhisperType listening overlay with a live waveform](docs/screenshots/whispertype-listening-overlay.png)
@@ -17,10 +20,10 @@ A compact live waveform shows when WhisperType is listening.
 
 ![WhisperType settings window](docs/screenshots/whispertype-settings.png)
 
-Configure the shortcut, model, GPU acceleration, output mode, language, and
+Configure the shortcut, model, acceleration, output mode, language, and
 recording overlay.
 
-### System tray
+### Windows system tray
 
 ![WhisperType idle in the Windows system tray](docs/screenshots/whispertype-tray-idle.png)
 
