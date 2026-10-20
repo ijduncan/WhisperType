@@ -370,28 +370,79 @@ class KeyboardBackend:
                   f"input_monitoring={input_monitoring}")
         return accessibility and input_monitoring
 
-    def paste(self) -> bool:
-        """Send the platform paste shortcut; return False if permission is absent."""
+    def frontmost_app(self):
+        """The app that currently has focus (macOS), or None."""
+        if self.platform_name != "darwin":
+            return None
+        try:
+            from AppKit import NSWorkspace
+
+            return NSWorkspace.sharedWorkspace().frontmostApplication()
+        except Exception as exc:
+            print(f"[out] Could not read the frontmost app: {exc}")
+            return None
+
+    def paste(self, target_app=None) -> bool:
+        """Send the platform paste shortcut; return False if permission is absent.
+
+        On macOS, ``target_app`` (an NSRunningApplication captured when
+        dictation started) is brought back to the front first, so the paste
+        cannot land in a WhisperType window.
+        """
         if self.platform_name == "darwin":
             if not self.request_accessibility(prompt=True):
                 return False
-            # Post Cmd+V with CGEvents rather than pynput's Controller: pynput
-            # looks up the keyboard layout through Text Input Sources, which
-            # macOS 14+ only allows on the main thread and aborts the process
-            # otherwise. CGEventPost is safe from the transcription worker.
+            import os
+            import time
+
+            current = self.frontmost_app()
+            if target_app is not None and not target_app.isTerminated() and (
+                current is None
+                or current.processIdentifier() != target_app.processIdentifier()
+            ):
+                target_app.activateWithOptions_(0)
+                for _ in range(20):  # wait up to ~0.5 s for the switch
+                    time.sleep(0.025)
+                    current = self.frontmost_app()
+                    if current is not None and (
+                        current.processIdentifier() == target_app.processIdentifier()
+                    ):
+                        break
+            if current is not None and current.processIdentifier() == os.getpid():
+                print("[out] WhisperType is frontmost; paste would land in itself")
+            name = current.localizedName() if current is not None else "unknown"
+            print(f"[out] Pasting into {name}")
+
+            # Post a full Command-down, V, Command-up sequence with CGEvents
+            # (not pynput's Controller, which reads the keyboard layout via
+            # Text Input Sources and is killed off the main thread on macOS
+            # 14+). Some apps ignore a bare V carrying only a Command flag.
             from Quartz import (
                 CGEventCreateKeyboardEvent,
                 CGEventPost,
                 CGEventSetFlags,
+                CGEventSourceCreate,
                 kCGEventFlagMaskCommand,
-                kCGHIDEventTap,
+                kCGEventSourceStateCombinedSessionState,
+                kCGSessionEventTap,
             )
 
-            v_keycode = 9  # kVK_ANSI_V
-            for key_down in (True, False):
-                event = CGEventCreateKeyboardEvent(None, v_keycode, key_down)
-                CGEventSetFlags(event, kCGEventFlagMaskCommand)
-                CGEventPost(kCGHIDEventTap, event)
+            source = CGEventSourceCreate(kCGEventSourceStateCombinedSessionState)
+            command_keycode, v_keycode = 55, 9  # kVK_Command, kVK_ANSI_V
+            sequence = (
+                (command_keycode, True),
+                (v_keycode, True),
+                (v_keycode, False),
+                (command_keycode, False),
+            )
+            for keycode, key_down in sequence:
+                event = CGEventCreateKeyboardEvent(source, keycode, key_down)
+                if keycode == v_keycode or key_down:
+                    CGEventSetFlags(event, kCGEventFlagMaskCommand)
+                else:
+                    CGEventSetFlags(event, 0)
+                CGEventPost(kCGSessionEventTap, event)
+                time.sleep(0.012)
             return True
         import keyboard
 

@@ -712,6 +712,9 @@ class WhisperType:
 
         self.stream = stream
         self.recording = True
+        # Remember where the user was typing so the paste can go back there
+        # even if a WhisperType window (overlay, Settings) became active.
+        self._paste_target = self.keyboard.frontmost_app()
         if IS_MACOS:
             self._capture_stop = threading.Event()
             self._capture_thread = threading.Thread(
@@ -783,7 +786,7 @@ class WhisperType:
         pyperclip.copy(text)
         if self.cfg["output_mode"] == "paste":
             time.sleep(0.08)  # let modifiers from the hotkey fully release
-            if self.keyboard.paste():
+            if self.keyboard.paste(getattr(self, "_paste_target", None)):
                 self.hotkey_error = None
                 print("[out] Pasted into focused app.")
             else:
