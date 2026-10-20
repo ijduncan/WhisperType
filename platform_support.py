@@ -153,11 +153,48 @@ def _mac_key_name(key) -> str | None:
     return char.lower() if isinstance(char, str) and len(char) == 1 else None
 
 
+_pynput_layout_pinned = False
+
+
+def pin_pynput_keyboard_layout() -> None:
+    """Read the keyboard layout once on the main thread and reuse it in pynput.
+
+    pynput's listeners call ``keycode_context()`` (TISCopyCurrentKeyboardInputSource)
+    on their own thread; macOS 14+ asserts that Text Input Sources are only
+    touched on the main thread and kills the process. Call this from the main
+    thread before any listener starts. Layout switches made while the app runs
+    are not picked up until it restarts.
+    """
+    global _pynput_layout_pinned
+    if not IS_MACOS or _pynput_layout_pinned:
+        return
+    if threading.current_thread() is not threading.main_thread():
+        print("[keyboard] layout must be pinned on the main thread; skipped")
+        return
+    import contextlib
+
+    import pynput._util.darwin as util_darwin
+    import pynput.keyboard._darwin as keyboard_darwin
+
+    with util_darwin.keycode_context() as context:
+        cached = context
+
+    @contextlib.contextmanager
+    def cached_keycode_context():
+        yield cached
+
+    util_darwin.keycode_context = cached_keycode_context
+    keyboard_darwin.keycode_context = cached_keycode_context
+    _pynput_layout_pinned = True
+
+
 class KeyboardBackend:
     """Register/capture a global shortcut and synthesize the platform paste."""
 
     def __init__(self, platform_name: str | None = None):
         self.platform_name = platform_name or sys.platform
+        if self.platform_name == "darwin":
+            pin_pynput_keyboard_layout()
 
     def validate(self, hotkey: str) -> str:
         if self.platform_name == "win32":
