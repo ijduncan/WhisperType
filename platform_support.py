@@ -254,31 +254,68 @@ class KeyboardBackend:
             raise RuntimeError(f"unsupported platform: {self.platform_name}")
 
         from pynput import keyboard
+        import pynput._util.darwin as util_darwin
+        from Quartz import (
+            CGEventGetFlags,
+            kCGEventFlagMaskAlternate,
+            kCGEventFlagMaskCommand,
+            kCGEventFlagMaskControl,
+            kCGEventFlagMaskShift,
+            kCGEventKeyDown,
+        )
 
-        modifiers: set[str] = set()
+        modifier_masks = (
+            ("ctrl", kCGEventFlagMaskControl),
+            ("option", kCGEventFlagMaskAlternate),
+            ("cmd", kCGEventFlagMaskCommand),
+            ("shift", kCGEventFlagMaskShift),
+        )
         result: list[str] = []
         done = threading.Event()
+        key_down_flags = [0]
+
+        class FlagRecordingListener(keyboard.Listener):
+            # Record the key-down event's own modifier flags before pynput
+            # dispatches it to on_press (darwin_intercept runs only after).
+            def _handle_message(self, proxy, event_type, event, refcon, injected):
+                if event_type == kCGEventKeyDown:
+                    key_down_flags[0] = CGEventGetFlags(event)
+                super()._handle_message(proxy, event_type, event, refcon, injected)
+
+        def key_token(key) -> str | None:
+            if getattr(key, "name", None):
+                return _mac_key_name(key)
+            # Modifier-only (flagsChanged) events arrive as KeyCodes with no
+            # char; skip them. For real keys use the unmodified character for
+            # the virtual key, since Option/Shift change ``char`` (Option+K
+            # reports "˚").
+            if getattr(key, "char", None) is None:
+                return None
+            vk = getattr(key, "vk", None)
+            if vk is not None:
+                with util_darwin.keycode_context() as context:
+                    base = util_darwin.keycode_to_string(context, vk)
+                if base and len(base) == 1 and base.isprintable():
+                    return base.lower()
+            return _mac_key_name(key)
 
         def on_press(key, *_injected):
-            token = _mac_key_name(key)
-            if not token:
+            token = key_token(key)
+            if not token or token in {"ctrl", "option", "shift", "cmd"}:
                 return
-            if token in {"ctrl", "option", "shift", "cmd"}:
-                modifiers.add(token)
-                return
+            # Take the modifiers from the key-down event itself rather than
+            # tracking their press/release events, which pynput can miss or
+            # report as unnamed KeyCodes.
+            flags = key_down_flags[0]
+            held = [name for name, mask in modifier_masks if flags & mask]
             try:
-                result.append(normalize_hotkey("+".join([*modifiers, token]), "darwin"))
-            except ValueError:
-                pass
+                result.append(normalize_hotkey("+".join([*held, token]), "darwin"))
+            except ValueError as exc:
+                print(f"[hotkey] could not use {'+'.join([*held, token])!r}: {exc}")
             done.set()
             return False
 
-        def on_release(key, *_injected):
-            token = _mac_key_name(key)
-            if token in {"ctrl", "option", "shift", "cmd"}:
-                modifiers.discard(token)
-
-        listener = keyboard.Listener(on_press=on_press, on_release=on_release)
+        listener = FlagRecordingListener(on_press=on_press)
         listener.start()
         done.wait(timeout=30)
         listener.stop()

@@ -976,7 +976,8 @@ class WhisperType:
                 def capture():
                     try:
                         combo = self.keyboard.capture()
-                    except Exception:
+                    except Exception as e:
+                        print(f"[hotkey] capture failed: {e}")
                         combo = None
 
                     def done():
