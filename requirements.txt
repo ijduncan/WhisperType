@@ -6,6 +6,12 @@ pynput==1.8.2; sys_platform == "darwin"
 pyobjc-framework-Cocoa>=10.3; sys_platform == "darwin"
 pyobjc-framework-Quartz>=10.3; sys_platform == "darwin"
 pyobjc-framework-ApplicationServices>=10.3; sys_platform == "darwin"
+# Apple-silicon GPU transcription (MLX). mlx-whisper itself is installed from
+# requirements-mlx.txt with --no-deps; these are the dependencies it actually
+# needs at runtime.
+mlx==0.32.4; sys_platform == "darwin" and platform_machine == "arm64"
+tiktoken==0.14.0; sys_platform == "darwin" and platform_machine == "arm64"
+more-itertools>=10.0; sys_platform == "darwin" and platform_machine == "arm64"
 pyperclip==1.9.0
 pystray==0.19.5
 pillow==11.1.0

@@ -36,6 +36,7 @@ cd "$ROOT_DIR"
 "$PYTHON_BIN" -m venv .venv
 "$ROOT_DIR/.venv/bin/python" -m pip install --upgrade pip
 "$ROOT_DIR/.venv/bin/python" -m pip install -r requirements.txt
+bash "$ROOT_DIR/macos/install_mlx.sh" "$ROOT_DIR/.venv/bin/python"
 "$ROOT_DIR/.venv/bin/python" -m pip install "pyinstaller>=6.22.0,<6.23"
 
 echo

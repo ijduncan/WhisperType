@@ -1,0 +1,9 @@
+# Install with: pip install --no-deps -r requirements-mlx.txt  (macOS, Apple silicon)
+#
+# mlx-whisper declares torch, numba and scipy as dependencies. torch is only
+# used by its model-conversion script, and numba/scipy only for word-level
+# timestamps, which WhisperType does not use (mlx_backend stubs that module).
+# Skipping them keeps roughly 700 MB out of the app. Its real runtime
+# dependencies (mlx, tiktoken, more-itertools, huggingface_hub, tqdm, numpy)
+# come from requirements.txt.
+mlx-whisper==0.4.3; sys_platform == "darwin" and platform_machine == "arm64"

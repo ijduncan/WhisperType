@@ -114,8 +114,16 @@ cd "$ROOT_DIR"
     --collect-all onnxruntime \
     --collect-all av \
     --collect-all _sounddevice_data \
+    --collect-all mlx \
+    --collect-data mlx_whisper \
+    --hidden-import mlx_whisper.transcribe \
+    --hidden-import mlx_backend \
     --exclude-module matplotlib \
     --exclude-module torch \
+    --exclude-module mlx_whisper.torch_whisper \
+    --exclude-module mlx_whisper.convert \
+    --exclude-module numba \
+    --exclude-module scipy \
     --distpath "$APP_DIST_DIR" \
     --workpath "$WORK_DIR" \
     --specpath "$WORK_DIR/spec" \
