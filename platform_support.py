@@ -153,11 +153,48 @@ def _mac_key_name(key) -> str | None:
     return char.lower() if isinstance(char, str) and len(char) == 1 else None
 
 
+_pynput_layout_pinned = False
+
+
+def pin_pynput_keyboard_layout() -> None:
+    """Read the keyboard layout once on the main thread and reuse it in pynput.
+
+    pynput's listeners call ``keycode_context()`` (TISCopyCurrentKeyboardInputSource)
+    on their own thread; macOS 14+ asserts that Text Input Sources are only
+    touched on the main thread and kills the process. Call this from the main
+    thread before any listener starts. Layout switches made while the app runs
+    are not picked up until it restarts.
+    """
+    global _pynput_layout_pinned
+    if not IS_MACOS or _pynput_layout_pinned:
+        return
+    if threading.current_thread() is not threading.main_thread():
+        print("[keyboard] layout must be pinned on the main thread; skipped")
+        return
+    import contextlib
+
+    import pynput._util.darwin as util_darwin
+    import pynput.keyboard._darwin as keyboard_darwin
+
+    with util_darwin.keycode_context() as context:
+        cached = context
+
+    @contextlib.contextmanager
+    def cached_keycode_context():
+        yield cached
+
+    util_darwin.keycode_context = cached_keycode_context
+    keyboard_darwin.keycode_context = cached_keycode_context
+    _pynput_layout_pinned = True
+
+
 class KeyboardBackend:
     """Register/capture a global shortcut and synthesize the platform paste."""
 
     def __init__(self, platform_name: str | None = None):
         self.platform_name = platform_name or sys.platform
+        if self.platform_name == "darwin":
+            pin_pynput_keyboard_layout()
 
     def validate(self, hotkey: str) -> str:
         if self.platform_name == "win32":
@@ -216,32 +253,73 @@ class KeyboardBackend:
         if self.platform_name != "darwin":
             raise RuntimeError(f"unsupported platform: {self.platform_name}")
 
-        from pynput import keyboard
+        if not self.request_input_monitoring(prompt=True):
+            print("[hotkey] Input Monitoring permission required to record a shortcut")
+            return None
 
-        modifiers: set[str] = set()
+        from pynput import keyboard
+        import pynput._util.darwin as util_darwin
+        from Quartz import (
+            CGEventGetFlags,
+            kCGEventFlagMaskAlternate,
+            kCGEventFlagMaskCommand,
+            kCGEventFlagMaskControl,
+            kCGEventFlagMaskShift,
+            kCGEventKeyDown,
+        )
+
+        modifier_masks = (
+            ("ctrl", kCGEventFlagMaskControl),
+            ("option", kCGEventFlagMaskAlternate),
+            ("cmd", kCGEventFlagMaskCommand),
+            ("shift", kCGEventFlagMaskShift),
+        )
         result: list[str] = []
         done = threading.Event()
+        key_down_flags = [0]
+
+        class FlagRecordingListener(keyboard.Listener):
+            # Record the key-down event's own modifier flags before pynput
+            # dispatches it to on_press (darwin_intercept runs only after).
+            def _handle_message(self, proxy, event_type, event, refcon, injected):
+                if event_type == kCGEventKeyDown:
+                    key_down_flags[0] = CGEventGetFlags(event)
+                super()._handle_message(proxy, event_type, event, refcon, injected)
+
+        def key_token(key) -> str | None:
+            if getattr(key, "name", None):
+                return _mac_key_name(key)
+            # Modifier-only (flagsChanged) events arrive as KeyCodes with no
+            # char; skip them. For real keys use the unmodified character for
+            # the virtual key, since Option/Shift change ``char`` (Option+K
+            # reports "˚").
+            if getattr(key, "char", None) is None:
+                return None
+            vk = getattr(key, "vk", None)
+            if vk is not None:
+                with util_darwin.keycode_context() as context:
+                    base = util_darwin.keycode_to_string(context, vk)
+                if base and len(base) == 1 and base.isprintable():
+                    return base.lower()
+            return _mac_key_name(key)
 
         def on_press(key, *_injected):
-            token = _mac_key_name(key)
-            if not token:
+            token = key_token(key)
+            if not token or token in {"ctrl", "option", "shift", "cmd"}:
                 return
-            if token in {"ctrl", "option", "shift", "cmd"}:
-                modifiers.add(token)
-                return
+            # Take the modifiers from the key-down event itself rather than
+            # tracking their press/release events, which pynput can miss or
+            # report as unnamed KeyCodes.
+            flags = key_down_flags[0]
+            held = [name for name, mask in modifier_masks if flags & mask]
             try:
-                result.append(normalize_hotkey("+".join([*modifiers, token]), "darwin"))
-            except ValueError:
-                pass
+                result.append(normalize_hotkey("+".join([*held, token]), "darwin"))
+            except ValueError as exc:
+                print(f"[hotkey] could not use {'+'.join([*held, token])!r}: {exc}")
             done.set()
             return False
 
-        def on_release(key, *_injected):
-            token = _mac_key_name(key)
-            if token in {"ctrl", "option", "shift", "cmd"}:
-                modifiers.discard(token)
-
-        listener = keyboard.Listener(on_press=on_press, on_release=on_release)
+        listener = FlagRecordingListener(on_press=on_press)
         listener.start()
         done.wait(timeout=30)
         listener.stop()
@@ -251,7 +329,7 @@ class KeyboardBackend:
         if self.platform_name != "darwin":
             return True
         try:
-            from Quartz import (
+            from ApplicationServices import (
                 AXIsProcessTrustedWithOptions,
                 kAXTrustedCheckOptionPrompt,
             )
@@ -262,16 +340,109 @@ class KeyboardBackend:
             print(f"[permissions] Could not check Accessibility access: {exc}")
             return False
 
-    def paste(self) -> bool:
-        """Send the platform paste shortcut; return False if permission is absent."""
+    def request_input_monitoring(self, prompt: bool = True) -> bool:
+        """Check (and optionally request) Input Monitoring.
+
+        pynput's listeners use a listen-only event tap, which macOS feeds
+        only to apps with Input Monitoring; Accessibility alone is not
+        enough. Requesting it also adds WhisperType to that settings list.
+        """
+        if self.platform_name != "darwin":
+            return True
+        try:
+            from Quartz import CGPreflightListenEventAccess, CGRequestListenEventAccess
+
+            if CGPreflightListenEventAccess():
+                return True
+            if prompt:
+                CGRequestListenEventAccess()
+            return False
+        except Exception as exc:
+            print(f"[permissions] Could not check Input Monitoring access: {exc}")
+            return False
+
+    def request_hotkey_access(self, prompt: bool = True) -> bool:
+        """Accessibility and Input Monitoring, both needed to hear hotkeys."""
+        accessibility = self.request_accessibility(prompt=prompt)
+        input_monitoring = self.request_input_monitoring(prompt=prompt)
+        if prompt:
+            print(f"[permissions] accessibility={accessibility} "
+                  f"input_monitoring={input_monitoring}")
+        return accessibility and input_monitoring
+
+    def frontmost_app(self):
+        """The app that currently has focus (macOS), or None."""
+        if self.platform_name != "darwin":
+            return None
+        try:
+            from AppKit import NSWorkspace
+
+            return NSWorkspace.sharedWorkspace().frontmostApplication()
+        except Exception as exc:
+            print(f"[out] Could not read the frontmost app: {exc}")
+            return None
+
+    def paste(self, target_app=None) -> bool:
+        """Send the platform paste shortcut; return False if permission is absent.
+
+        On macOS, ``target_app`` (an NSRunningApplication captured when
+        dictation started) is brought back to the front first, so the paste
+        cannot land in a WhisperType window.
+        """
         if self.platform_name == "darwin":
             if not self.request_accessibility(prompt=True):
                 return False
-            from pynput.keyboard import Controller, Key
+            import os
+            import time
 
-            controller = Controller()
-            with controller.pressed(Key.cmd):
-                controller.tap("v")
+            current = self.frontmost_app()
+            if target_app is not None and not target_app.isTerminated() and (
+                current is None
+                or current.processIdentifier() != target_app.processIdentifier()
+            ):
+                target_app.activateWithOptions_(0)
+                for _ in range(20):  # wait up to ~0.5 s for the switch
+                    time.sleep(0.025)
+                    current = self.frontmost_app()
+                    if current is not None and (
+                        current.processIdentifier() == target_app.processIdentifier()
+                    ):
+                        break
+            if current is not None and current.processIdentifier() == os.getpid():
+                print("[out] WhisperType is frontmost; paste would land in itself")
+            name = current.localizedName() if current is not None else "unknown"
+            print(f"[out] Pasting into {name}")
+
+            # Post a full Command-down, V, Command-up sequence with CGEvents
+            # (not pynput's Controller, which reads the keyboard layout via
+            # Text Input Sources and is killed off the main thread on macOS
+            # 14+). Some apps ignore a bare V carrying only a Command flag.
+            from Quartz import (
+                CGEventCreateKeyboardEvent,
+                CGEventPost,
+                CGEventSetFlags,
+                CGEventSourceCreate,
+                kCGEventFlagMaskCommand,
+                kCGEventSourceStateCombinedSessionState,
+                kCGSessionEventTap,
+            )
+
+            source = CGEventSourceCreate(kCGEventSourceStateCombinedSessionState)
+            command_keycode, v_keycode = 55, 9  # kVK_Command, kVK_ANSI_V
+            sequence = (
+                (command_keycode, True),
+                (v_keycode, True),
+                (v_keycode, False),
+                (command_keycode, False),
+            )
+            for keycode, key_down in sequence:
+                event = CGEventCreateKeyboardEvent(source, keycode, key_down)
+                if keycode == v_keycode or key_down:
+                    CGEventSetFlags(event, kCGEventFlagMaskCommand)
+                else:
+                    CGEventSetFlags(event, 0)
+                CGEventPost(kCGSessionEventTap, event)
+                time.sleep(0.012)
             return True
         import keyboard
 
@@ -279,13 +450,14 @@ class KeyboardBackend:
         return True
 
 
-def open_accessibility_settings() -> None:
+def open_accessibility_settings(pane: str = "accessibility") -> None:
     if not IS_MACOS:
         return
     subprocess.Popen(
         [
             "open",
-            "x-apple.systempreferences:com.apple.preference.security?Privacy_Accessibility",
+            "x-apple.systempreferences:com.apple.preference.security?"
+            + ("Privacy_Accessibility" if pane == "accessibility" else "Privacy_ListenEvent"),
         ],
         close_fds=True,
     )

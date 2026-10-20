@@ -8,6 +8,7 @@ app. No internet is used after the model has been downloaded once.
 
 import json
 import math
+import multiprocessing
 import os
 import queue
 import sys
@@ -478,11 +479,14 @@ class UiThread:
                 pass
 
     def call(self, fn):
-        """Run fn on the UI thread."""
+        """Run fn on the UI thread.
+
+        Always queued, even from the UI thread itself: on macOS the menu-bar
+        callbacks arrive on the main thread while tkinter's mainloop still
+        holds its Tcl lock inside Tcl_DoOneEvent, so touching Tk inline there
+        deadlocks (the Settings item hung the app with a spinning cursor).
+        """
         if self.root is None:
-            return
-        if threading.get_ident() == self._thread_id:
-            fn()
             return
         self._jobs.put(fn)
 
@@ -533,11 +537,11 @@ class WhisperType:
     def apply_hotkey(self, new_hotkey):
         """Re-register the global hotkey live and persist it."""
         normalized = self.keyboard.validate(new_hotkey)
-        if IS_MACOS and not self.keyboard.request_accessibility(prompt=False):
+        if IS_MACOS and not self.keyboard.request_hotkey_access(prompt=False):
             self.keyboard.unregister(self._hotkey_handle)
             self._hotkey_handle = None
             self.cfg["hotkey"] = normalized
-            self.hotkey_error = "Accessibility permission required for the hotkey"
+            self.hotkey_error = "Accessibility + Input Monitoring needed for the hotkey"
             self.save_config()
             self._refresh_menu()
             self._schedule_accessibility_retry()
@@ -708,6 +712,9 @@ class WhisperType:
 
         self.stream = stream
         self.recording = True
+        # Remember where the user was typing so the paste can go back there
+        # even if a WhisperType window (overlay, Settings) became active.
+        self._paste_target = self.keyboard.frontmost_app()
         if IS_MACOS:
             self._capture_stop = threading.Event()
             self._capture_thread = threading.Thread(
@@ -779,7 +786,7 @@ class WhisperType:
         pyperclip.copy(text)
         if self.cfg["output_mode"] == "paste":
             time.sleep(0.08)  # let modifiers from the hotkey fully release
-            if self.keyboard.paste():
+            if self.keyboard.paste(getattr(self, "_paste_target", None)):
                 self.hotkey_error = None
                 print("[out] Pasted into focused app.")
             else:
@@ -865,10 +872,10 @@ class WhisperType:
             self._accessibility_retry_scheduled = False
             if self._quitting or self._hotkey_handle is not None:
                 return
-            if self.keyboard.request_accessibility(prompt=False):
+            if self.keyboard.request_hotkey_access(prompt=False):
                 self._activate_configured_hotkey()
             else:
-                self.hotkey_error = "Accessibility permission required for the hotkey"
+                self.hotkey_error = "Accessibility + Input Monitoring needed for the hotkey"
                 self._refresh_menu()
                 self._schedule_accessibility_retry()
 
@@ -928,6 +935,10 @@ class WhisperType:
                 "Accessibility Settings…",
                 lambda icon, item: open_accessibility_settings(),
             ))
+            items.append(pystray.MenuItem(
+                "Input Monitoring Settings…",
+                lambda icon, item: open_accessibility_settings("input_monitoring"),
+            ))
         items.extend([pystray.Menu.SEPARATOR, pystray.MenuItem("Quit", self.quit)])
         return pystray.Menu(*items)
 
@@ -972,7 +983,8 @@ class WhisperType:
                 def capture():
                     try:
                         combo = self.keyboard.capture()
-                    except Exception:
+                    except Exception as e:
+                        print(f"[hotkey] capture failed: {e}")
                         combo = None
 
                     def done():
@@ -1226,9 +1238,9 @@ class WhisperType:
         # Register the global hotkey (tracks the handle for live re-binding).
         accessibility_ready = True
         if IS_MACOS:
-            accessibility_ready = self.keyboard.request_accessibility(prompt=True)
+            accessibility_ready = self.keyboard.request_hotkey_access(prompt=True)
         if not accessibility_ready:
-            self.hotkey_error = "Accessibility permission required for the hotkey"
+            self.hotkey_error = "Accessibility + Input Monitoring needed for the hotkey"
         else:
             self._activate_configured_hotkey()
         print(f"[ready] Hotkey: {self.cfg['hotkey']}  "
@@ -1728,6 +1740,20 @@ def check():
 
 
 def main():
+    # A frozen app re-executes its own binary for multiprocessing helpers
+    # (faster-whisper's resource tracker); without this each helper launches
+    # another full copy of WhisperType.
+    multiprocessing.freeze_support()
+    if IS_MACOS and getattr(sys, "frozen", False) and not sys.stdout.isatty():
+        # A Finder-launched app has nowhere to print; keep a log users (and
+        # bug reports) can find.
+        try:
+            log_path = os.path.expanduser("~/Library/Logs/WhisperType.log")
+            log = open(log_path, "a", buffering=1, encoding="utf-8")
+            sys.stdout = sys.stderr = log
+            print(f"--- WhisperType start {time.strftime('%Y-%m-%d %H:%M:%S')}")
+        except OSError:
+            pass
     if "--check" in sys.argv:
         sys.exit(check())
     if "--fetch" in sys.argv:
