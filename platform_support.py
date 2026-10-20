@@ -365,6 +365,9 @@ class KeyboardBackend:
         """Accessibility and Input Monitoring, both needed to hear hotkeys."""
         accessibility = self.request_accessibility(prompt=prompt)
         input_monitoring = self.request_input_monitoring(prompt=prompt)
+        if prompt:
+            print(f"[permissions] accessibility={accessibility} "
+                  f"input_monitoring={input_monitoring}")
         return accessibility and input_monitoring
 
     def paste(self) -> bool:

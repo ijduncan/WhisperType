@@ -1741,6 +1741,16 @@ def main():
     # (faster-whisper's resource tracker); without this each helper launches
     # another full copy of WhisperType.
     multiprocessing.freeze_support()
+    if IS_MACOS and getattr(sys, "frozen", False) and not sys.stdout.isatty():
+        # A Finder-launched app has nowhere to print; keep a log users (and
+        # bug reports) can find.
+        try:
+            log_path = os.path.expanduser("~/Library/Logs/WhisperType.log")
+            log = open(log_path, "a", buffering=1, encoding="utf-8")
+            sys.stdout = sys.stderr = log
+            print(f"--- WhisperType start {time.strftime('%Y-%m-%d %H:%M:%S')}")
+        except OSError:
+            pass
     if "--check" in sys.argv:
         sys.exit(check())
     if "--fetch" in sys.argv:
