@@ -267,11 +267,23 @@ class KeyboardBackend:
         if self.platform_name == "darwin":
             if not self.request_accessibility(prompt=True):
                 return False
-            from pynput.keyboard import Controller, Key
+            # Post Cmd+V with CGEvents rather than pynput's Controller: pynput
+            # looks up the keyboard layout through Text Input Sources, which
+            # macOS 14+ only allows on the main thread and aborts the process
+            # otherwise. CGEventPost is safe from the transcription worker.
+            from Quartz import (
+                CGEventCreateKeyboardEvent,
+                CGEventPost,
+                CGEventSetFlags,
+                kCGEventFlagMaskCommand,
+                kCGHIDEventTap,
+            )
 
-            controller = Controller()
-            with controller.pressed(Key.cmd):
-                controller.tap("v")
+            v_keycode = 9  # kVK_ANSI_V
+            for key_down in (True, False):
+                event = CGEventCreateKeyboardEvent(None, v_keycode, key_down)
+                CGEventSetFlags(event, kCGEventFlagMaskCommand)
+                CGEventPost(kCGHIDEventTap, event)
             return True
         import keyboard
 
