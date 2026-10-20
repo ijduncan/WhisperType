@@ -8,6 +8,7 @@ app. No internet is used after the model has been downloaded once.
 
 import json
 import math
+import multiprocessing
 import os
 import queue
 import sys
@@ -1728,6 +1729,10 @@ def check():
 
 
 def main():
+    # A frozen app re-executes its own binary for multiprocessing helpers
+    # (faster-whisper's resource tracker); without this each helper launches
+    # another full copy of WhisperType.
+    multiprocessing.freeze_support()
     if "--check" in sys.argv:
         sys.exit(check())
     if "--fetch" in sys.argv:

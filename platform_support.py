@@ -251,7 +251,7 @@ class KeyboardBackend:
         if self.platform_name != "darwin":
             return True
         try:
-            from Quartz import (
+            from ApplicationServices import (
                 AXIsProcessTrustedWithOptions,
                 kAXTrustedCheckOptionPrompt,
             )
