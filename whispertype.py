@@ -479,11 +479,14 @@ class UiThread:
                 pass
 
     def call(self, fn):
-        """Run fn on the UI thread."""
+        """Run fn on the UI thread.
+
+        Always queued, even from the UI thread itself: on macOS the menu-bar
+        callbacks arrive on the main thread while tkinter's mainloop still
+        holds its Tcl lock inside Tcl_DoOneEvent, so touching Tk inline there
+        deadlocks (the Settings item hung the app with a spinning cursor).
+        """
         if self.root is None:
-            return
-        if threading.get_ident() == self._thread_id:
-            fn()
             return
         self._jobs.put(fn)
 
