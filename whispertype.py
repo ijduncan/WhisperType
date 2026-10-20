@@ -1,5 +1,5 @@
 """
-WhisperType - Offline voice-to-text for Windows.
+WhisperType - Offline voice-to-text for Windows and macOS.
 
 Press a global hotkey to start recording, press again to stop. Your speech is
 transcribed locally with Whisper (faster-whisper) and pasted into the focused
@@ -9,16 +9,28 @@ app. No internet is used after the model has been downloaded once.
 import json
 import math
 import os
+import queue
 import sys
 import threading
 import time
 
 import numpy as np
 import sounddevice as sd
-import keyboard
 import pyperclip
 import pystray
 from PIL import Image, ImageDraw
+
+from platform_support import (
+    IS_MACOS,
+    IS_WINDOWS,
+    KeyboardBackend,
+    default_acceleration,
+    default_hotkey,
+    default_model,
+    normalize_hotkey,
+    open_accessibility_settings,
+    user_data_dir,
+)
 
 APP_DIR = os.path.dirname(os.path.abspath(__file__))
 
@@ -26,9 +38,8 @@ APP_DIR = os.path.dirname(os.path.abspath(__file__))
 def _data_dir():
     """Writable per-user folder for components fetched after install
     (models, CUDA libraries). Survives upgrades and needs no admin rights."""
-    if getattr(sys, "frozen", False):
-        base = os.environ.get("LOCALAPPDATA") or os.environ.get("APPDATA") or APP_DIR
-        d = os.path.join(base, "WhisperType")
+    if getattr(sys, "frozen", False) or os.environ.get("WHISPERTYPE_DATA_DIR"):
+        d = user_data_dir()
     else:
         d = APP_DIR
     try:
@@ -41,8 +52,17 @@ def _data_dir():
 def _config_path():
     """Config lives next to the script when running from source, but in a
     writable per-user folder when installed (Program Files is read-only)."""
+    if os.environ.get("WHISPERTYPE_DATA_DIR"):
+        d = user_data_dir()
+        os.makedirs(d, exist_ok=True)
+        return os.path.join(d, "config.json")
     if getattr(sys, "frozen", False):
-        d = os.path.join(os.environ.get("APPDATA", APP_DIR), "WhisperType")
+        # Preserve the existing Windows roaming-config location while macOS
+        # keeps all writable state in Application Support.
+        if IS_WINDOWS and os.environ.get("APPDATA"):
+            d = os.path.join(os.environ["APPDATA"], "WhisperType")
+        else:
+            d = user_data_dir()
         os.makedirs(d, exist_ok=True)
         return os.path.join(d, "config.json")
     return os.path.join(APP_DIR, "config.json")
@@ -97,6 +117,16 @@ def _register_cuda_dlls():
         print(f"[cuda] Could not register CUDA DLL dirs: {e}")
 
 
+def _model_is_complete(path):
+    return (
+        os.path.isfile(os.path.join(path, "model.bin"))
+        and any(
+            os.path.isfile(os.path.join(path, filename))
+            for filename in ("vocabulary.json", "vocabulary.txt", "tokenizer.json")
+        )
+    )
+
+
 def _local_models():
     """Every model present on disk, as {name: path}."""
     found = {}
@@ -105,8 +135,10 @@ def _local_models():
         if not os.path.isdir(mdir):
             continue
         for n in os.listdir(mdir):
+            if n.startswith("."):
+                continue
             p = os.path.join(mdir, n)
-            if n not in found and os.path.isfile(os.path.join(p, "model.bin")):
+            if n not in found and _model_is_complete(p):
                 found[n] = p
     return found
 
@@ -126,16 +158,26 @@ def _resolve_model(name):
         print(f"[model] '{name}' is not installed; using '{alt}' instead. "
               f"Installed: {sorted(local)}")
         return local[alt]
+    if IS_MACOS and getattr(sys, "frozen", False) and name in MODELS:
+        # Keep downloads outside the signed .app bundle so they survive app
+        # upgrades and do not invalidate the bundle signature.
+        print(f"[model] First launch — downloading '{name}' to {_data_dir()}.")
+        fetch_model(name, _data_dir())
+        installed = _local_models().get(name)
+        if installed:
+            return installed
     print(f"[model] '{name}' is not installed locally — downloading from "
           f"Hugging Face, which can take several minutes.")
     return name
 
+DEFAULT_DEVICE, DEFAULT_COMPUTE_TYPE = default_acceleration()
+
 DEFAULT_CONFIG = {
-    "hotkey": "ctrl+alt+windows+space",  # global toggle hotkey
-    "model": "medium.en",          # whisper model (medium.en = accurate, English)
+    "hotkey": default_hotkey(),      # global toggle hotkey
+    "model": default_model(),        # smaller CPU default on macOS
     "language": "en",              # transcription language
-    "device": "cuda",              # "cuda" (NVIDIA GPU) or "cpu"
-    "compute_type": "float16",     # float16 on GPU; use "int8" on CPU
+    "device": DEFAULT_DEVICE,        # NVIDIA CUDA on Windows, CPU on macOS
+    "compute_type": DEFAULT_COMPUTE_TYPE,
     "output_mode": "paste",        # "paste" into focused app, or "clipboard" only
     "show_overlay": True,          # live waveform panel while recording
     "sample_rate": 16000,          # Whisper expects 16 kHz
@@ -159,6 +201,19 @@ def load_config():
                 print(f"[config] Kept the unreadable file as {bad}")
             except Exception:
                 pass
+    # CTranslate2's macOS wheels are CPU-only.  Migrate a copied Windows config
+    # instead of repeatedly attempting a CUDA load on every launch.
+    if IS_MACOS and cfg.get("device") != "cpu":
+        cfg["device"], cfg["compute_type"] = "cpu", "int8"
+    try:
+        configured_hotkey = str(cfg.get("hotkey", default_hotkey()))
+        if IS_WINDOWS:
+            cfg["hotkey"] = KeyboardBackend("win32").validate(configured_hotkey)
+        else:
+            cfg["hotkey"] = normalize_hotkey(configured_hotkey)
+    except Exception:
+        cfg["hotkey"] = default_hotkey()
+
     # Write back so the user has a complete file to edit.
     try:
         with open(CONFIG_PATH, "w", encoding="utf-8") as f:
@@ -212,12 +267,28 @@ class Overlay:
         self._visible = False
         self._anim = None
         self._phase = 0.0
+        self._nonactivating = False
 
     # -- win32 window styling ----------------------------------------------
     def _make_click_through(self):
+        if IS_MACOS:
+            try:
+                # Tk's Aqua backend maps this to a non-activating help panel.
+                # ignoreClicks keeps the overlay from intercepting the app the
+                # user is dictating into.
+                self.win.tk.call(
+                    "::tk::unsupported::MacWindowStyle",
+                    "style", self.win._w, "help",
+                    "noActivates ignoreClicks doesNotHide",
+                )
+                self._nonactivating = True
+            except Exception as e:
+                print(f"[overlay] could not set macOS panel style: {e}")
+            return
+        if not IS_WINDOWS:
+            return
         try:
             import ctypes
-            from ctypes import wintypes
             hwnd = int(self.win.frame(), 16)
             GWL_EXSTYLE = -20
             WS_EX_LAYERED = 0x00080000
@@ -232,10 +303,13 @@ class Overlay:
                 style | WS_EX_LAYERED | WS_EX_TRANSPARENT
                 | WS_EX_NOACTIVATE | WS_EX_TOOLWINDOW,
             )
+            self._nonactivating = True
         except Exception as e:
             print(f"[overlay] could not set click-through styles: {e}")
 
     def _round_corners(self, radius=16):
+        if not IS_WINDOWS:
+            return
         try:
             import ctypes
             hwnd = int(self.win.frame(), 16)
@@ -248,6 +322,7 @@ class Overlay:
     def _build(self):
         import tkinter as tk
         self.win = tk.Toplevel(self.ui.root)
+        self.win.withdraw()
         self.win.overrideredirect(True)          # no title bar / borders
         self.win.attributes("-topmost", True)
         self.win.attributes("-alpha", 0.92)
@@ -264,7 +339,6 @@ class Overlay:
         x = int((sw - self.W) / 2)
         y = int(sh - self.H - 96)
         self.win.geometry(f"{self.W}x{self.H}+{x}+{y}")
-        self.win.withdraw()
         self.win.update_idletasks()
         self._make_click_through()
         self._round_corners()
@@ -300,7 +374,7 @@ class Overlay:
         c.create_text(
             self.W / 2, self.H - label_h / 2 - 4,
             text=self.status, fill="#9aa0a6",
-            font=("Segoe UI", 9),
+            font=(("Helvetica Neue", 11) if IS_MACOS else ("Segoe UI", 9)),
         )
 
     def _tick(self):
@@ -349,32 +423,81 @@ class Overlay:
 
 
 class UiThread:
-    """Owns a single hidden Tk root on a dedicated thread, so tkinter work is
-    always marshalled to one place (pystray owns the main thread)."""
+    """Own a single hidden Tk root and marshal all Tk work through a queue.
+
+    Windows lets pystray own the main thread and runs Tk in a worker.  On
+    macOS, Tk must own the main thread, so pystray is attached to that native
+    run loop with ``run_detached``.
+    """
 
     def __init__(self):
         self.root = None
         self._ready = threading.Event()
+        self._jobs = queue.Queue()
+        self._on_main_thread = False
+        self._thread_id = None
 
-    def start(self):
-        threading.Thread(target=self._run, daemon=True).start()
+    def start(self, on_main_thread=False):
+        self._on_main_thread = on_main_thread
+        if on_main_thread:
+            self._init_root()
+        else:
+            threading.Thread(target=self._run, daemon=True).start()
         self._ready.wait(timeout=10)
 
-    def _run(self):
+    def _init_root(self):
         import tkinter as tk
+        self._thread_id = threading.get_ident()
         self.root = tk.Tk()
         self.root.withdraw()
+        self.root.after(16, self._drain)
         self._ready.set()
+
+    def _run(self):
+        self._init_root()
         self.root.mainloop()
+
+    def run_mainloop(self):
+        if self.root is not None:
+            self.root.mainloop()
+
+    def _drain(self):
+        while True:
+            try:
+                fn = self._jobs.get_nowait()
+            except queue.Empty:
+                break
+            try:
+                fn()
+            except Exception as e:
+                print(f"[ui] callback failed: {e}")
+        if self.root is not None:
+            try:
+                self.root.after(16, self._drain)
+            except Exception:
+                pass
 
     def call(self, fn):
         """Run fn on the UI thread."""
         if self.root is None:
             return
-        try:
-            self.root.after(0, fn)
-        except Exception:
-            pass
+        if threading.get_ident() == self._thread_id:
+            fn()
+            return
+        self._jobs.put(fn)
+
+    def stop(self):
+        def go():
+            if self.root is None:
+                return
+            root, self.root = self.root, None
+            try:
+                root.quit()
+                root.destroy()
+            except Exception:
+                pass
+
+        self.call(go)
 
 
 class WhisperType:
@@ -386,9 +509,15 @@ class WhisperType:
         self.recording = False
         self.frames = []
         self.stream = None
+        self._capture_thread = None
+        self._capture_stop = None
         self.icon = None
         self._hotkey_handle = None
+        self._accessibility_retry_scheduled = False
         self._settings_open = False
+        self._quitting = False
+        self.keyboard = KeyboardBackend()
+        self.hotkey_error = None
         self.ui = UiThread()
         self.overlay = Overlay(self.ui)
         self.load_error = None
@@ -403,31 +532,57 @@ class WhisperType:
 
     def apply_hotkey(self, new_hotkey):
         """Re-register the global hotkey live and persist it."""
-        try:
-            if self._hotkey_handle is not None:
-                keyboard.remove_hotkey(self._hotkey_handle)
-        except Exception:
-            pass
-        self._hotkey_handle = keyboard.add_hotkey(new_hotkey, self.on_hotkey)
-        self.cfg["hotkey"] = new_hotkey
+        normalized = self.keyboard.validate(new_hotkey)
+        if IS_MACOS and not self.keyboard.request_accessibility(prompt=False):
+            self.keyboard.unregister(self._hotkey_handle)
+            self._hotkey_handle = None
+            self.cfg["hotkey"] = normalized
+            self.hotkey_error = "Accessibility permission required for the hotkey"
+            self.save_config()
+            self._refresh_menu()
+            self._schedule_accessibility_retry()
+            return
+        new_handle = self.keyboard.register(normalized, self.on_hotkey)
+        old_handle, self._hotkey_handle = self._hotkey_handle, new_handle
+        self.keyboard.unregister(old_handle)
+        self.cfg["hotkey"] = normalized
+        self.hotkey_error = None
         self.save_config()
-        print(f"[cfg] hotkey = {new_hotkey}")
-        if self.icon is not None:
-            try:
-                self.icon.update_menu()
-            except Exception:
-                pass
+        print(f"[cfg] hotkey = {normalized}")
+        self._refresh_menu()
 
     # -- tray helpers -------------------------------------------------------
+    def _on_icon_thread(self, callback):
+        """Keep AppKit-backed pystray mutations on macOS's main thread."""
+        if IS_MACOS:
+            self.ui.call(callback)
+        else:
+            callback()
+
+    def _refresh_menu(self):
+        def refresh():
+            if self.icon is not None:
+                try:
+                    self.icon.update_menu()
+                except Exception:
+                    pass
+
+        self._on_icon_thread(refresh)
+
     def set_state(self, state):
         self.state = state
-        if self.icon is not None:
-            self.icon.icon = ICONS[state]
-            self.icon.title = f"WhisperType — {state}"
-            try:
-                self.icon.update_menu()
-            except Exception:
-                pass
+
+        def refresh():
+            if self.icon is not None:
+                current = self.state
+                self.icon.icon = ICONS[current]
+                self.icon.title = f"WhisperType — {current}"
+                try:
+                    self.icon.update_menu()
+                except Exception:
+                    pass
+
+        self._on_icon_thread(refresh)
 
     # -- model --------------------------------------------------------------
     def _load_model_guarded(self):
@@ -476,7 +631,7 @@ class WhisperType:
         self.set_state("idle")
 
     # -- recording ----------------------------------------------------------
-    def _audio_cb(self, indata, frames, time_info, status):
+    def _store_audio(self, indata, status=None):
         if status:
             print(f"[audio] {status}", file=sys.stderr)
         self.frames.append(indata.copy())
@@ -485,17 +640,83 @@ class WhisperType:
             rms = float(np.sqrt(np.mean(np.square(indata)))) if indata.size else 0.0
             self.overlay.push_level(min(1.0, (rms ** 0.5) * 3.2))
 
+    def _audio_cb(self, indata, frames, time_info, status):
+        self._store_audio(indata, status)
+
+    def _read_audio_blocks(self, stream, stop_event, blocksize):
+        """Read microphone frames without a CFFI callback on macOS.
+
+        CFFI callbacks require write+execute memory in frozen applications,
+        which conflicts with Apple's hardened runtime.  PortAudio's blocking
+        read API avoids that entitlement and keeps the bundle hardened.
+        """
+        try:
+            while not stop_event.is_set():
+                indata, overflowed = stream.read(blocksize)
+                self._store_audio(
+                    indata,
+                    "input overflow" if overflowed else None,
+                )
+        except Exception as e:
+            if not stop_event.is_set() and not self._quitting:
+                self.recording = False
+                try:
+                    stream.abort()
+                    stream.close()
+                except Exception:
+                    pass
+                if self.stream is stream:
+                    self.stream = None
+                self.load_error = f"Microphone unavailable: {e}"
+                self.overlay.hide()
+                self.set_state("error")
+                print(f"[audio] {self.load_error}")
+
+    def _stop_capture_reader(self):
+        stop_event = self._capture_stop
+        capture_thread = self._capture_thread
+        if stop_event is not None:
+            stop_event.set()
+        if (capture_thread is not None
+                and capture_thread is not threading.current_thread()):
+            capture_thread.join(timeout=1.0)
+        self._capture_stop = None
+        self._capture_thread = None
+
     def start_recording(self):
         self.frames = []
-        self.stream = sd.InputStream(
-            samplerate=self.cfg["sample_rate"],
-            channels=1,
-            dtype="float32",
-            blocksize=int(self.cfg["sample_rate"] * 0.03),   # ~30 ms per bar
-            callback=self._audio_cb,
-        )
-        self.stream.start()
+        blocksize = int(self.cfg["sample_rate"] * 0.03)   # ~30 ms per bar
+        stream = None
+        try:
+            kwargs = {
+                "samplerate": self.cfg["sample_rate"],
+                "channels": 1,
+                "dtype": "float32",
+                "blocksize": blocksize,
+            }
+            if not IS_MACOS:
+                kwargs["callback"] = self._audio_cb
+            stream = sd.InputStream(**kwargs)
+            stream.start()
+        except Exception:
+            if stream is not None:
+                try:
+                    stream.close()
+                except Exception:
+                    pass
+            raise
+
+        self.stream = stream
         self.recording = True
+        if IS_MACOS:
+            self._capture_stop = threading.Event()
+            self._capture_thread = threading.Thread(
+                target=self._read_audio_blocks,
+                args=(stream, self._capture_stop, blocksize),
+                daemon=True,
+                name="WhisperTypeAudioReader",
+            )
+            self._capture_thread.start()
         self.set_state("recording")
         if self.cfg.get("show_overlay", True):
             self.overlay.show("Listening")
@@ -503,6 +724,7 @@ class WhisperType:
 
     def stop_recording(self):
         self.recording = False
+        self._stop_capture_reader()
         try:
             self.stream.stop()
             self.stream.close()
@@ -539,6 +761,13 @@ class WhisperType:
             )
             text = "".join(s.text for s in segments).strip()
             print(f"[stt] {time.time() - t0:.1f}s → {text!r}")
+        except Exception as e:
+            import traceback
+
+            traceback.print_exc()
+            self.load_error = f"Transcription failed: {e}"
+            self.set_state("error")
+            return
         finally:
             # Always drop the overlay before pasting, so focus/z-order is clean.
             self.overlay.hide()
@@ -550,31 +779,101 @@ class WhisperType:
         pyperclip.copy(text)
         if self.cfg["output_mode"] == "paste":
             time.sleep(0.08)  # let modifiers from the hotkey fully release
-            keyboard.send("ctrl+v")
-            print("[out] Pasted into focused app.")
+            if self.keyboard.paste():
+                self.hotkey_error = None
+                print("[out] Pasted into focused app.")
+            else:
+                self.hotkey_error = (
+                    "Accessibility permission required; text copied to clipboard"
+                )
+                print("[out] Accessibility access is missing; copied to clipboard.")
+                self._refresh_menu()
         else:
             print("[out] Copied to clipboard.")
 
     # -- hotkey dispatch ----------------------------------------------------
     def on_hotkey(self):
-        # Runs in the keyboard hook thread; keep it snappy by handing the
-        # heavy work to a worker thread.
+        # Never run audio or NumPy work inside pynput's listener callback.  An
+        # exception escaping that callback permanently stops the listener.
+        threading.Thread(
+            target=self._handle_hotkey,
+            daemon=True,
+            name="WhisperTypeHotkey",
+        ).start()
+
+    def _handle_hotkey(self):
         with self.lock:
-            if self.state == "loading":
-                print("[hotkey] Model still loading, please wait…")
-                return
-            if not self.recording:
-                self.start_recording()
-            else:
-                audio = self.stop_recording()
-                if audio is not None:
-                    threading.Thread(
-                        target=self.transcribe_and_output,
-                        args=(audio,),
-                        daemon=True,
-                    ).start()
+            try:
+                if self.state == "loading":
+                    print("[hotkey] Model still loading, please wait…")
+                    return
+                if not self.recording:
+                    self.start_recording()
+                else:
+                    audio = self.stop_recording()
+                    if audio is not None:
+                        threading.Thread(
+                            target=self.transcribe_and_output,
+                            args=(audio,),
+                            daemon=True,
+                            name="WhisperTypeTranscription",
+                        ).start()
+            except Exception as e:
+                import traceback
+
+                traceback.print_exc()
+                self.recording = False
+                self._stop_capture_reader()
+                stream, self.stream = self.stream, None
+                if stream is not None:
+                    try:
+                        stream.abort()
+                        stream.close()
+                    except Exception:
+                        pass
+                self.load_error = f"Microphone unavailable: {e}"
+                self.overlay.hide()
+                self.set_state("error")
+                print(f"[audio] {self.load_error}")
 
     # -- lifecycle ----------------------------------------------------------
+    def _activate_configured_hotkey(self):
+        if self._hotkey_handle is not None:
+            return True
+        try:
+            self._hotkey_handle = self.keyboard.register(
+                self.cfg["hotkey"], self.on_hotkey
+            )
+            self.hotkey_error = None
+            self._refresh_menu()
+            print(f"[hotkey] Active: {self.cfg['hotkey']}")
+            return True
+        except Exception as e:
+            self.hotkey_error = f"Hotkey unavailable: {e}"
+            self._refresh_menu()
+            print(f"[hotkey] {self.hotkey_error}")
+            return False
+
+    def _schedule_accessibility_retry(self, delay_ms=1500):
+        if (not IS_MACOS or self._quitting
+                or self._accessibility_retry_scheduled
+                or self.ui.root is None):
+            return
+        self._accessibility_retry_scheduled = True
+
+        def poll():
+            self._accessibility_retry_scheduled = False
+            if self._quitting or self._hotkey_handle is not None:
+                return
+            if self.keyboard.request_accessibility(prompt=False):
+                self._activate_configured_hotkey()
+            else:
+                self.hotkey_error = "Accessibility permission required for the hotkey"
+                self._refresh_menu()
+                self._schedule_accessibility_retry()
+
+        self.ui.root.after(delay_ms, poll)
+
     def toggle_output_mode(self, icon, item):
         self.cfg["output_mode"] = (
             "clipboard" if self.cfg["output_mode"] == "paste" else "paste"
@@ -583,8 +882,8 @@ class WhisperType:
         print(f"[cfg] output_mode = {self.cfg['output_mode']}")
 
     def open_settings(self, icon, item):
-        # Run the Tk dialog on its own thread so it doesn't fight pystray's
-        # message loop. Only one window at a time.
+        # Marshal the Tk dialog to its owning UI thread. Only one window at a
+        # time is allowed.
         if self._settings_open:
             return
         self._settings_open = True
@@ -598,10 +897,16 @@ class WhisperType:
         print(f"[cfg] show_overlay = {self.cfg['show_overlay']}")
 
     def build_menu(self):
-        return pystray.Menu(
+        def status_text(item):
+            if self.load_error:
+                return f"Error: {self.load_error[:60]}"
+            if self.hotkey_error:
+                return self.hotkey_error[:70]
+            return f"Status: {self.state}"
+
+        items = [
             pystray.MenuItem(
-                lambda item: (f"Error: {self.load_error[:60]}" if self.load_error
-                              else f"Status: {self.state}"),
+                status_text,
                 None, enabled=False),
             pystray.MenuItem(lambda item: f"Model: {self.cfg['model']}", None, enabled=False),
             pystray.MenuItem(lambda item: f"Hotkey: {self.cfg['hotkey']}", None, enabled=False),
@@ -617,9 +922,14 @@ class WhisperType:
                 checked=lambda item: self.cfg.get("show_overlay", True),
             ),
             pystray.MenuItem("Settings…", self.open_settings),
-            pystray.Menu.SEPARATOR,
-            pystray.MenuItem("Quit", self.quit),
-        )
+        ]
+        if IS_MACOS:
+            items.append(pystray.MenuItem(
+                "Accessibility Settings…",
+                lambda icon, item: open_accessibility_settings(),
+            ))
+        items.extend([pystray.Menu.SEPARATOR, pystray.MenuItem("Quit", self.quit)])
+        return pystray.Menu(*items)
 
     # -- settings window ----------------------------------------------------
     def _run_settings_window(self):
@@ -631,9 +941,15 @@ class WhisperType:
             root = tk.Toplevel(self.ui.root)
             root.title("WhisperType Settings")
             root.resizable(False, False)
+            if IS_MACOS:
+                try:
+                    from AppKit import NSApp
+                    NSApp.activateIgnoringOtherApps_(True)
+                except Exception:
+                    pass
             try:
                 ico = os.path.join(_bundle_dir(), "icon.ico")
-                if os.path.isfile(ico):
+                if IS_WINDOWS and os.path.isfile(ico):
                     root.iconbitmap(ico)
             except Exception:
                 pass
@@ -655,21 +971,23 @@ class WhisperType:
 
                 def capture():
                     try:
-                        combo = keyboard.read_hotkey(suppress=False)
+                        combo = self.keyboard.capture()
                     except Exception:
                         combo = None
+
                     def done():
                         if combo:
                             hotkey_var.set(combo)
                         record_btn.config(text="Record", state="normal")
-                    root.after(0, done)
+
+                    self.ui.call(done)
 
                 threading.Thread(target=capture, daemon=True).start()
 
             record_btn.config(command=record_keys)
             record_btn.grid(row=1, column=1, padx=(8, 0), pady=(2, 0))
             ttk.Label(
-                frm, text="e.g. ctrl+alt+windows+space", foreground="#777"
+                frm, text=f"e.g. {default_hotkey()}", foreground="#777"
             ).grid(row=2, column=0, columnspan=2, sticky="w", pady=(2, 10))
 
             # --- Speech model ---
@@ -693,16 +1011,23 @@ class WhisperType:
             ).grid(row=4, column=0, columnspan=2, sticky="we", pady=(2, 10))
 
             # --- Acceleration ---
-            gpu_ready = cuda_installed()
-            gpu_label = ("GPU — NVIDIA (installed)" if gpu_ready
-                         else f"GPU — NVIDIA (download {_human_mb(CUDA_MB)})")
-            cpu_label = "CPU — works everywhere, slower"
+            if IS_MACOS:
+                gpu_label = None
+                cpu_label = "CPU — supported on macOS"
+                accel_values = [cpu_label]
+                accel_value = cpu_label
+            else:
+                gpu_ready = cuda_installed()
+                gpu_label = ("GPU — NVIDIA (installed)" if gpu_ready
+                             else f"GPU — NVIDIA (download {_human_mb(CUDA_MB)})")
+                cpu_label = "CPU — works everywhere, slower"
+                accel_values = [gpu_label, cpu_label]
+                accel_value = gpu_label if self.cfg["device"] == "cuda" else cpu_label
             ttk.Label(frm, text="Acceleration").grid(row=5, column=0, sticky="w")
-            accel_var = tk.StringVar(
-                value=gpu_label if self.cfg["device"] == "cuda" else cpu_label)
+            accel_var = tk.StringVar(value=accel_value)
             ttk.Combobox(
                 frm, textvariable=accel_var, state="readonly", width=50,
-                values=[gpu_label, cpu_label],
+                values=accel_values,
             ).grid(row=6, column=0, columnspan=2, sticky="we", pady=(2, 10))
 
             # --- Output mode ---
@@ -736,20 +1061,24 @@ class WhisperType:
             btns.grid(row=14, column=0, columnspan=2, sticky="e", pady=(6, 0))
 
             def on_save():
-                new_hotkey = hotkey_var.get().strip().lower()
-                if not new_hotkey:
+                requested_hotkey = hotkey_var.get().strip().lower()
+                if not requested_hotkey:
                     messagebox.showerror("WhisperType", "Hotkey cannot be empty.")
                     return
                 # Validate the hotkey before committing to it.
+                try:
+                    new_hotkey = self.keyboard.validate(requested_hotkey)
+                except Exception as e:
+                    messagebox.showerror(
+                        "WhisperType", f"'{requested_hotkey}' is not a valid hotkey.\n\n{e}")
+                    return
                 if new_hotkey != self.cfg["hotkey"]:
                     try:
-                        h = keyboard.add_hotkey(new_hotkey, self.on_hotkey)
-                        keyboard.remove_hotkey(h)
+                        self.apply_hotkey(new_hotkey)
                     except Exception as e:
                         messagebox.showerror(
-                            "WhisperType", f"'{new_hotkey}' is not a valid hotkey.\n\n{e}")
+                            "WhisperType", f"Could not register '{new_hotkey}'.\n\n{e}")
                         return
-                    self.apply_hotkey(new_hotkey)
                 self.cfg["output_mode"] = output_var.get()
                 self.cfg["language"] = lang_var.get().strip() or "en"
                 self.cfg["show_overlay"] = bool(overlay_var.get())
@@ -758,7 +1087,7 @@ class WhisperType:
 
                 # Model / acceleration may require a download before they apply.
                 new_model = model_names[labels.index(model_var.get())]
-                want_cuda = accel_var.get() == gpu_label
+                want_cuda = bool(gpu_label and accel_var.get() == gpu_label)
                 model_changed = new_model != self.cfg["model"]
                 device_changed = want_cuda != (self.cfg["device"] == "cuda")
                 needs_dl = (new_model not in _local_models()
@@ -766,11 +1095,7 @@ class WhisperType:
 
                 if not (model_changed or device_changed):
                     self.save_config()
-                    if self.icon is not None:
-                        try:
-                            self.icon.update_menu()
-                        except Exception:
-                            pass
+                    self._refresh_menu()
                     print("[cfg] Settings saved.")
                     close()
                     return
@@ -784,11 +1109,7 @@ class WhisperType:
                         self.cfg["device"] = "cpu"
                         self.cfg["compute_type"] = "int8"
                     self.save_config()
-                    if self.icon is not None:
-                        try:
-                            self.icon.update_menu()
-                        except Exception:
-                            pass
+                    self._refresh_menu()
 
                 if not needs_dl:
                     apply_choice()
@@ -807,13 +1128,13 @@ class WhisperType:
 
                 def set_status(msg):
                     base_text["msg"] = msg
-                    root.after(0, lambda: prog_label.config(text=msg))
+                    self.ui.call(lambda: prog_label.config(text=msg))
 
                 def set_progress(done, total):
                     pct = max(0.0, min(100.0, (done / total * 100) if total else 0))
                     text = f"{base_text['msg']}  {_human_mb(done)} of {_human_mb(total)}"
-                    root.after(0, lambda: (prog_bar.config(value=pct),
-                                           prog_label.config(text=text)))
+                    self.ui.call(lambda: (prog_bar.config(value=pct),
+                                          prog_label.config(text=text)))
 
                 def worker():
                     try:
@@ -823,17 +1144,29 @@ class WhisperType:
                     except Exception as e:
                         import traceback
                         traceback.print_exc()
-                        root.after(0, lambda: (
+                        error_text = str(e)
+                        self.ui.call(lambda error_text=error_text: (
                             messagebox.showerror(
                                 "WhisperType",
-                                f"Could not download the components.\n\n{e}"),
+                                f"Could not download the components.\n\n{error_text}"),
                             save_btn.config(state="normal"),
                             cancel_btn.config(state="normal"),
                             prog_label.grid_remove(),
                             prog_bar.grid_remove()))
                         return
-                    apply_choice()
-                    root.after(0, close)
+                    applied = threading.Event()
+
+                    def commit_choice():
+                        try:
+                            apply_choice()
+                            close()
+                        finally:
+                            applied.set()
+
+                    self.ui.call(commit_choice)
+                    if not applied.wait(timeout=10):
+                        print("[cfg] Timed out applying downloaded components")
+                        return
                     print(f"[cfg] Switching to {new_model} on {self.cfg['device']}")
                     self.reload_model()
 
@@ -868,31 +1201,63 @@ class WhisperType:
             self._settings_open = False
 
     def quit(self, icon, item):
+        self._quitting = True
+        self.recording = False
+        self._stop_capture_reader()
         try:
             if self.stream:
                 self.stream.stop()
                 self.stream.close()
         except Exception:
             pass
+        self.keyboard.unregister(self._hotkey_handle)
+        self._hotkey_handle = None
+        # On macOS pystray and Tk share NSApplication.  Stop the menu-bar
+        # integration before tearing down Tk's root so pystray can wake and
+        # exit the still-valid native event loop cleanly.
         icon.stop()
-        os._exit(0)
+        self.ui.stop()
 
     def run(self):
-        # Single Tk thread shared by the overlay and the settings window.
-        self.ui.start()
+        # Aqua/Tk must own the main thread.  Windows keeps its existing split
+        # where pystray owns main and Tk runs in a dedicated UI thread.
+        self.ui.start(on_main_thread=IS_MACOS)
 
         # Register the global hotkey (tracks the handle for live re-binding).
-        self._hotkey_handle = keyboard.add_hotkey(self.cfg["hotkey"], self.on_hotkey)
+        accessibility_ready = True
+        if IS_MACOS:
+            accessibility_ready = self.keyboard.request_accessibility(prompt=True)
+        if not accessibility_ready:
+            self.hotkey_error = "Accessibility permission required for the hotkey"
+        else:
+            self._activate_configured_hotkey()
         print(f"[ready] Hotkey: {self.cfg['hotkey']}  "
               f"(output: {self.cfg['output_mode']})")
 
-        # Load the model in the background so the tray appears immediately.
+        icon_kwargs = {}
+        if IS_MACOS:
+            from AppKit import NSApplication
+            icon_kwargs["darwin_nsapplication"] = NSApplication.sharedApplication()
+        self.icon = pystray.Icon(
+            "WhisperType", ICONS["loading"], "WhisperType — loading",
+            self.build_menu(), **icon_kwargs,
+        )
+        if IS_MACOS and not accessibility_ready:
+            self._schedule_accessibility_retry()
+
+        # Load the model in the background so the menu-bar/tray icon appears
+        # immediately, even while a first-run model download is in progress.
         threading.Thread(target=self._load_model_guarded, daemon=True).start()
 
-        self.icon = pystray.Icon(
-            "WhisperType", ICONS["loading"], "WhisperType — loading", self.build_menu()
-        )
-        self.icon.run()
+        if IS_MACOS:
+            self.icon.run_detached(
+                setup=lambda icon: self.ui.call(
+                    lambda: setattr(icon, "visible", True)
+                )
+            )
+            self.ui.run_mainloop()
+        else:
+            self.icon.run()
 
 
 def selftest():
@@ -967,6 +1332,8 @@ def _dir_size_mb(path):
 
 def cuda_installed():
     """True if the CUDA runtime libraries are already unpacked."""
+    if not IS_WINDOWS:
+        return False
     for root in _nvidia_roots():
         if all(os.path.isfile(os.path.join(root, *s.split("/")))
                for _p, _v, s in CUDA_WHEELS):
@@ -1022,6 +1389,8 @@ def _download(url, dest, label=""):
 
 def fetch_cuda(dest_root):
     """Download + unpack the CUDA DLLs into <dest_root>/nvidia/<lib>/bin."""
+    if not IS_WINDOWS:
+        raise RuntimeError("NVIDIA CUDA acceleration is only supported on Windows")
     import tempfile
     import zipfile
     out = os.path.join(dest_root, "nvidia")
@@ -1060,13 +1429,45 @@ def fetch_model(name, dest_root):
     """
     if name not in MODELS:
         raise SystemExit(f"unknown model '{name}' (choose from {list(MODELS)})")
-    out = os.path.join(dest_root, "models", name)
-    os.makedirs(out, exist_ok=True)
+    import shutil
+    import tempfile
+    import uuid
+
+    models_root = os.path.join(dest_root, "models")
+    out = os.path.join(models_root, name)
+    if _model_is_complete(out):
+        print(f"[fetch] model '{name}' already installed", flush=True)
+        return
+
+    staging_root = os.path.join(models_root, ".downloads")
+    os.makedirs(staging_root, exist_ok=True)
+    staging = tempfile.mkdtemp(prefix=f"{name}-", dir=staging_root)
+    backup = None
     print(f"[fetch] downloading model '{name}' (this can take a few minutes)",
           flush=True)
-    from faster_whisper import download_model
-    download_model(name, output_dir=out)
-    _verify_model(out, name)
+    try:
+        from faster_whisper import download_model
+
+        download_model(name, output_dir=staging)
+        _verify_model(staging, name)
+        if os.path.exists(out):
+            backup = os.path.join(
+                staging_root,
+                f"{name}-previous-{uuid.uuid4().hex}",
+            )
+            os.replace(out, backup)
+        os.replace(staging, out)
+        staging = None
+    except BaseException:
+        if backup and os.path.exists(backup) and not os.path.exists(out):
+            os.replace(backup, out)
+            backup = None
+        raise
+    finally:
+        if staging and os.path.exists(staging):
+            shutil.rmtree(staging, ignore_errors=True)
+        if backup and os.path.exists(backup):
+            shutil.rmtree(backup, ignore_errors=True)
     print(f"[fetch] model '{name}' ready in {out}", flush=True)
 
 
@@ -1074,11 +1475,7 @@ def _verify_model(path, name):
     """Fail loudly if a model directory is missing what CTranslate2 needs."""
     if not os.path.isfile(os.path.join(path, "model.bin")):
         raise RuntimeError(f"model '{name}' is missing model.bin")
-    have_vocab = any(
-        os.path.isfile(os.path.join(path, f))
-        for f in ("vocabulary.json", "vocabulary.txt", "tokenizer.json")
-    )
-    if not have_vocab:
+    if not _model_is_complete(path):
         raise RuntimeError(
             f"model '{name}' has no vocabulary/tokenizer file — it would fail "
             f"to load")
@@ -1138,6 +1535,9 @@ def fetch_main(argv):
     dest = _data_dir()
     model = None
     want_cuda = "--cuda" in argv
+    if want_cuda and not IS_WINDOWS:
+        print("[fetch] CUDA acceleration is only supported on Windows", flush=True)
+        return 2
     if "--model" in argv:
         i = argv.index("--model")
         if i + 1 < len(argv):
@@ -1173,7 +1573,7 @@ def fetch_main(argv):
 
 def overlaytest(seconds=4.0):
     """Show the overlay with simulated levels — verifies the panel works in a
-    frozen build (Tk + win32 styling) without needing the mic or hotkey."""
+    frozen build without needing the mic or hotkey."""
     import random
     import tempfile
     import traceback
@@ -1188,38 +1588,106 @@ def overlaytest(seconds=4.0):
     try:
         log(f"frozen={getattr(sys, 'frozen', False)}")
         ui = UiThread()
-        ui.start()
+        ui.start(on_main_thread=IS_MACOS)
         ov = Overlay(ui)
-        ov.show("Listening")
-        t0 = time.time()
-        while time.time() - t0 < seconds * 0.6:
-            t = time.time() - t0
-            ov.push_level(min(1.0, abs(math.sin(t * 2.2)) * (0.5 + 0.5 * random.random())))
-            time.sleep(0.03)
         info = {}
+        finished = threading.Event()
 
-        def probe():
-            info["geometry"] = ov.win.geometry()
-            info["mapped"] = bool(ov.win.winfo_ismapped())
-            import ctypes
-            ex = ctypes.windll.user32.GetWindowLongW(int(ov.win.frame(), 16), -20)
-            info["noactivate"] = bool(ex & 0x08000000)
-            info["transparent"] = bool(ex & 0x00000020)
+        def exercise():
+            ov.show("Listening")
+            t0 = time.time()
+            while time.time() - t0 < seconds * 0.6:
+                t = time.time() - t0
+                level = min(
+                    1.0,
+                    abs(math.sin(t * 2.2)) * (0.5 + 0.5 * random.random()),
+                )
+                ov.push_level(level)
+                time.sleep(0.03)
 
-        ui.call(probe)
-        time.sleep(0.6)
+            probed = threading.Event()
+
+            def probe():
+                info["geometry"] = ov.win.geometry()
+                info["mapped"] = bool(ov.win.winfo_ismapped())
+                info["nonactivating"] = ov._nonactivating
+                probed.set()
+
+            ui.call(probe)
+            probed.wait(timeout=2)
+            ov.set_status("Transcribing…")
+            time.sleep(seconds * 0.4)
+            ov.hide()
+            time.sleep(0.4)
+            finished.set()
+            ui.stop()
+
+        worker = threading.Thread(target=exercise, daemon=True)
+        worker.start()
+        if IS_MACOS:
+            ui.run_mainloop()
+        finished.wait(timeout=seconds + 4)
         for k, v in info.items():
             log(f"  {k} = {v}")
-        ov.set_status("Transcribing…")
-        time.sleep(seconds * 0.4)
-        ov.hide()
-        time.sleep(0.4)
-        ok = info.get("mapped") and info.get("noactivate") and info.get("transparent")
+        ok = info.get("mapped") and info.get("nonactivating")
         log("OVERLAYTEST OK" if ok else "OVERLAYTEST FAILED — window/styles wrong")
         if not ok:
             sys.exit(1)
     except Exception:
         log("OVERLAYTEST FAILED:\n" + traceback.format_exc())
+        sys.exit(1)
+
+
+def menutest(seconds=1.0):
+    """Exercise pystray's detached AppKit integration and clean shutdown."""
+    if not IS_MACOS:
+        print("MENUTEST skipped — macOS only")
+        return
+
+    import traceback
+
+    ui = None
+    icon = None
+    try:
+        from AppKit import NSApplication
+
+        ui = UiThread()
+        ui.start(on_main_thread=True)
+        icon = pystray.Icon(
+            "WhisperTypeSmokeTest",
+            ICONS["idle"],
+            "WhisperType smoke test",
+            pystray.Menu(pystray.MenuItem("Smoke test", None, enabled=False)),
+            darwin_nsapplication=NSApplication.sharedApplication(),
+        )
+        result = {"visible": False, "stopped": False}
+
+        def finish():
+            result["visible"] = bool(icon.visible)
+            icon.stop()
+            result["stopped"] = True
+            ui.stop()
+
+        ui.root.after(int(seconds * 1000), finish)
+        icon.run_detached(
+            setup=lambda tray_icon: ui.call(
+                lambda: setattr(tray_icon, "visible", True)
+            )
+        )
+        ui.run_mainloop()
+        if not all(result.values()):
+            raise RuntimeError(f"menu-bar lifecycle incomplete: {result}")
+        print("MENUTEST OK")
+    except Exception:
+        traceback.print_exc()
+        print("MENUTEST FAILED")
+        if icon is not None:
+            try:
+                icon.stop()
+            except Exception:
+                pass
+        if ui is not None:
+            ui.stop()
         sys.exit(1)
 
 
@@ -1236,7 +1704,14 @@ def check():
         import faster_whisper
         print(f"faster_whisper: {faster_whisper.__version__}")
         from faster_whisper import WhisperModel  # noqa: F401
-        import sounddevice, pystray, keyboard, pyperclip  # noqa: F401
+        import sounddevice, pystray, pyperclip  # noqa: F401
+        if IS_MACOS:
+            import AppKit, Quartz, pynput  # noqa: F401
+            from pynput import keyboard as pynput_keyboard  # noqa: F401
+            print("keyboard : pynput/darwin")
+        else:
+            import keyboard  # noqa: F401
+            print("keyboard : keyboard/win32")
         import tkinter
         from tkinter import ttk  # noqa: F401
         r = tkinter.Tk(); r.withdraw(); r.destroy()
@@ -1259,6 +1734,9 @@ def main():
         sys.exit(fetch_main(sys.argv))
     if "--overlaytest" in sys.argv:
         overlaytest()
+        return
+    if "--menutest" in sys.argv:
+        menutest()
         return
     if "--selftest" in sys.argv:
         selftest()
