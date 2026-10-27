@@ -52,7 +52,7 @@ class MacRuntimeTests(unittest.TestCase):
         root = _FakeRoot()
         app.ui = SimpleNamespace(root=root, call=lambda callback: callback())
         app.keyboard = mock.Mock()
-        app.keyboard.request_accessibility.side_effect = [False, True]
+        app.keyboard.request_hotkey_access.side_effect = [False, True]
         handle = object()
         app.keyboard.register.return_value = handle
 

@@ -153,14 +153,32 @@ plist_set_or_add CFBundleShortVersionString string "$BUNDLE_VERSION"
 plist_set_or_add CFBundleVersion string "$BUILD_NUMBER"
 plutil -lint "$PLIST_PATH"
 
-# Editing Info.plist invalidates PyInstaller's initial signature, so apply a
-# fresh ad-hoc signature. This is suitable for CI smoke builds. Public releases
-# should instead use a Developer ID Application identity and Apple notarization.
+# Editing Info.plist invalidates PyInstaller's initial signature, so sign again.
+# Ad-hoc ("-") is the default and suits CI smoke builds, but macOS keys an
+# ad-hoc app's Accessibility/Input Monitoring grants to its exact cdhash, so
+# every rebuild loses them. For local testing, a self-signed identity in a
+# dedicated keychain keeps a stable designated requirement across rebuilds:
+#   WHISPERTYPE_SIGN_KEYCHAIN (default ~/Library/Keychains/whispertype-signing.keychain-db)
+#   WHISPERTYPE_SIGN_KEYCHAIN_PASSWORD_FILE (default ~/.config/whispertype/signing-keychain-password)
+# WHISPERTYPE_SIGN_IDENTITY overrides both. Public releases should instead use
+# a Developer ID Application identity and Apple notarization.
+SIGN_IDENTITY="${WHISPERTYPE_SIGN_IDENTITY:-}"
+SIGN_KEYCHAIN="${WHISPERTYPE_SIGN_KEYCHAIN:-$HOME/Library/Keychains/whispertype-signing.keychain-db}"
+SIGN_KEYCHAIN_PASSWORD_FILE="${WHISPERTYPE_SIGN_KEYCHAIN_PASSWORD_FILE:-$HOME/.config/whispertype/signing-keychain-password}"
+if [[ -z "$SIGN_IDENTITY" && -f "$SIGN_KEYCHAIN" && -f "$SIGN_KEYCHAIN_PASSWORD_FILE" ]]; then
+    security unlock-keychain -p "$(cat "$SIGN_KEYCHAIN_PASSWORD_FILE")" "$SIGN_KEYCHAIN"
+    # Self-signed identities are reported as untrusted, so match by name
+    # without -v and sign by SHA-1 hash.
+    SIGN_IDENTITY="$(security find-identity -p codesigning "$SIGN_KEYCHAIN" \
+        | awk '/"WhisperType Local Signing"/ { print $2; exit }')"
+fi
+SIGN_IDENTITY="${SIGN_IDENTITY:--}"
+echo "Signing identity: $SIGN_IDENTITY"
 codesign \
     --force \
     --deep \
     --all-architectures \
-    --sign - \
+    --sign "$SIGN_IDENTITY" \
     --timestamp=none \
     --options=runtime \
     --entitlements "$ENTITLEMENTS_PATH" \
