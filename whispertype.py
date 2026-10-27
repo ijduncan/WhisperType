@@ -21,6 +21,7 @@ import pyperclip
 import pystray
 from PIL import Image, ImageDraw
 
+from streaming import StreamingTranscriber, silero_vad
 from mlx_backend import (
     MLX_DIRNAME,
     MLX_MODELS,
@@ -203,6 +204,7 @@ DEFAULT_CONFIG = {
     "show_overlay": True,          # live waveform panel while recording
     "sample_rate": 16000,          # Whisper expects 16 kHz
     "min_seconds": 0.3,            # ignore recordings shorter than this
+    "stream_transcription": True,  # transcribe at pauses while still recording
 }
 
 
@@ -533,6 +535,8 @@ class WhisperType:
         self.lock = threading.Lock()
         self.recording = False
         self.frames = []
+        self._streamer = None
+        self._model_lock = threading.Lock()  # one transcription at a time
         self.stream = None
         self._capture_thread = None
         self._capture_stop = None
@@ -779,10 +783,30 @@ class WhisperType:
                 name="WhisperTypeAudioReader",
             )
             self._capture_thread.start()
+        self._streamer = None
+        if self.cfg.get("stream_transcription", True) and self.model is not None:
+            self._streamer = StreamingTranscriber(
+                get_audio=self._audio_so_far,
+                transcribe=self._transcribe_audio,
+                vad=silero_vad(0.7, self.cfg["sample_rate"]),
+                sample_rate=self.cfg["sample_rate"],
+            )
+            self._streamer.start()
         self.set_state("recording")
         if self.cfg.get("show_overlay", True):
             self.overlay.show("Listening")
         print("[rec] Recording… press the hotkey again to stop.")
+
+    def _audio_so_far(self):
+        frames = list(self.frames)  # the reader thread keeps appending
+        if not frames:
+            return np.zeros(0, dtype=np.float32)
+        return np.concatenate(frames, axis=0).flatten().astype(np.float32)
+
+    def _drop_streamer(self):
+        streamer, self._streamer = self._streamer, None
+        if streamer is not None:
+            streamer.cancel()
 
     def stop_recording(self):
         self.recording = False
@@ -793,6 +817,7 @@ class WhisperType:
         finally:
             self.stream = None
         if not self.frames:
+            self._drop_streamer()
             self.overlay.hide()
             self.set_state("idle")
             return None
@@ -801,6 +826,7 @@ class WhisperType:
         print(f"[rec] Stopped ({secs:.1f}s).")
         if secs < self.cfg["min_seconds"]:
             print("[rec] Too short, ignoring.")
+            self._drop_streamer()
             self.overlay.hide()
             self.set_state("idle")
             return None
@@ -809,23 +835,31 @@ class WhisperType:
         return audio
 
     # -- transcription ------------------------------------------------------
-    def transcribe_and_output(self, audio):
+    def _transcribe_audio(self, audio, prompt=None):
+        """Transcribe one stretch of audio; safe to call from any thread."""
+        with self._model_lock:
+            if getattr(self, "engine", "ct2") == "mlx":
+                return self.model.transcribe(audio, self.cfg["language"], prompt)
+            segments, _ = self.model.transcribe(
+                audio,
+                language=self.cfg["language"],
+                vad_filter=True,
+                beam_size=5,
+                initial_prompt=prompt,
+            )
+            return "".join(s.text for s in segments).strip()
+
+    def transcribe_and_output(self, audio, streamer=None):
         self.set_state("working")
         print("[stt] Transcribing…")
         t0 = time.time()
         text = ""
         try:
-            if getattr(self, "engine", "ct2") == "mlx":
-                text = self.model.transcribe(audio, self.cfg["language"])
+            if streamer is not None:
+                text = streamer.finish(audio)
             else:
-                segments, _ = self.model.transcribe(
-                    audio,
-                    language=self.cfg["language"],
-                    vad_filter=True,
-                    beam_size=5,
-                )
-                text = "".join(s.text for s in segments).strip()
-            print(f"[stt] {time.time() - t0:.1f}s → {text!r}")
+                text = self._transcribe_audio(audio)
+            print(f"[stt] {time.time() - t0:.1f}s after stop → {text!r}")
         except Exception as e:
             import traceback
 
@@ -876,10 +910,11 @@ class WhisperType:
                     self.start_recording()
                 else:
                     audio = self.stop_recording()
+                    streamer, self._streamer = self._streamer, None
                     if audio is not None:
                         threading.Thread(
                             target=self.transcribe_and_output,
-                            args=(audio,),
+                            args=(audio, streamer),
                             daemon=True,
                             name="WhisperTypeTranscription",
                         ).start()
@@ -1125,12 +1160,21 @@ class WhisperType:
             ttk.Entry(frm, textvariable=lang_var, width=28).grid(
                 row=10, column=0, columnspan=2, sticky="we", pady=(2, 10))
 
-            # --- Overlay ---
+            # --- Overlay and streaming (one row, so later rows keep their place) ---
+            toggles = ttk.Frame(frm)
+            toggles.grid(row=11, column=0, columnspan=2, sticky="w", pady=(0, 8))
             overlay_var = tk.BooleanVar(value=self.cfg.get("show_overlay", True))
             ttk.Checkbutton(
-                frm, text="Show waveform overlay while recording",
+                toggles, text="Show waveform overlay while recording",
                 variable=overlay_var,
-            ).grid(row=11, column=0, columnspan=2, sticky="w", pady=(0, 8))
+            ).grid(row=0, column=0, sticky="w")
+            stream_var = tk.BooleanVar(
+                value=self.cfg.get("stream_transcription", True))
+            ttk.Checkbutton(
+                toggles,
+                text="Transcribe while I speak (shorter wait after stopping)",
+                variable=stream_var,
+            ).grid(row=1, column=0, sticky="w", pady=(4, 0))
 
             # --- Download progress (only shown when something must be fetched) ---
             prog_label = ttk.Label(frm, text="", foreground="#555")
@@ -1162,6 +1206,7 @@ class WhisperType:
                 self.cfg["output_mode"] = output_var.get()
                 self.cfg["language"] = lang_var.get().strip() or "en"
                 self.cfg["show_overlay"] = bool(overlay_var.get())
+                self.cfg["stream_transcription"] = bool(stream_var.get())
                 if not self.cfg["show_overlay"]:
                     self.overlay.hide()
 

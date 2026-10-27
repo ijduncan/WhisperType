@@ -136,7 +136,9 @@ class MlxWhisper:
         # second of silence so the first dictation isn't slowed by loading.
         self._decode(np.zeros(16000, dtype=np.float32), language="en")
 
-    def _decode(self, audio: np.ndarray, language: str | None) -> str:
+    def _decode(
+        self, audio: np.ndarray, language: str | None, prompt: str | None = None
+    ) -> str:
         import mlx_whisper
 
         result = mlx_whisper.transcribe(
@@ -145,11 +147,15 @@ class MlxWhisper:
             language=language or None,
             verbose=None,
             condition_on_previous_text=False,
+            initial_prompt=prompt or None,
         )
         return str(result.get("text", "")).strip()
 
-    def transcribe(self, audio: np.ndarray, language: str | None) -> str:
+    def transcribe(
+        self, audio: np.ndarray, language: str | None, prompt: str | None = None
+    ) -> str:
+        """``prompt``: preceding text, for consistent style across pieces."""
         speech = trim_to_speech(np.asarray(audio, dtype=np.float32))
         if speech.size < 1600:  # under 0.1 s of speech
             return ""
-        return self._decode(speech, language)
+        return self._decode(speech, language, prompt)
