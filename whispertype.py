@@ -21,6 +21,15 @@ import pyperclip
 import pystray
 from PIL import Image, ImageDraw
 
+from streaming import StreamingTranscriber, silero_vad
+from mlx_backend import (
+    MLX_DIRNAME,
+    MLX_MODELS,
+    fetch_mlx_model,
+    mlx_model_is_complete,
+    mlx_supported,
+)
+
 from platform_support import (
     IS_MACOS,
     IS_WINDOWS,
@@ -144,6 +153,18 @@ def _local_models():
     return found
 
 
+def _local_mlx_models():
+    """MLX (Apple GPU) models present on disk, as {name: path}."""
+    mdir = os.path.join(_data_dir(), MLX_DIRNAME)
+    if not os.path.isdir(mdir):
+        return {}
+    return {
+        n: os.path.join(mdir, n)
+        for n in os.listdir(mdir)
+        if not n.startswith(".") and mlx_model_is_complete(os.path.join(mdir, n))
+    }
+
+
 def _resolve_model(name):
     """Prefer a locally-present model over downloading from Hugging Face.
 
@@ -183,6 +204,7 @@ DEFAULT_CONFIG = {
     "show_overlay": True,          # live waveform panel while recording
     "sample_rate": 16000,          # Whisper expects 16 kHz
     "min_seconds": 0.3,            # ignore recordings shorter than this
+    "stream_transcription": True,  # transcribe at pauses while still recording
 }
 
 
@@ -202,9 +224,10 @@ def load_config():
                 print(f"[config] Kept the unreadable file as {bad}")
             except Exception:
                 pass
-    # CTranslate2's macOS wheels are CPU-only.  Migrate a copied Windows config
-    # instead of repeatedly attempting a CUDA load on every launch.
-    if IS_MACOS and cfg.get("device") != "cpu":
+    # CTranslate2's macOS wheels are CPU-only; the Mac GPU path is MLX.
+    # Migrate a copied Windows config instead of repeatedly attempting a CUDA
+    # load on every launch.
+    if IS_MACOS and cfg.get("device") not in ("cpu", "mlx"):
         cfg["device"], cfg["compute_type"] = "cpu", "int8"
     try:
         configured_hotkey = str(cfg.get("hotkey", default_hotkey()))
@@ -512,6 +535,8 @@ class WhisperType:
         self.lock = threading.Lock()
         self.recording = False
         self.frames = []
+        self._streamer = None
+        self._model_lock = threading.Lock()  # one transcription at a time
         self.stream = None
         self._capture_thread = None
         self._capture_stop = None
@@ -609,10 +634,43 @@ class WhisperType:
         self._load_model_guarded()
 
     def load_model(self):
+        if self.cfg["device"] == "mlx":
+            try:
+                self._load_mlx_model()
+                return
+            except Exception as e:
+                import traceback
+                traceback.print_exc()
+                print(f"[model] Apple GPU (MLX) load failed ({e}); "
+                      f"falling back to CPU.")
+        self._load_ct2_model()
+
+    def _load_mlx_model(self):
+        """Load the configured model on the Apple GPU through MLX."""
+        from mlx_backend import MlxWhisper
+        if not mlx_supported():
+            raise RuntimeError("MLX is not available on this Mac")
+        name = self.cfg["model"]
+        path = _local_mlx_models().get(name)
+        if path is None:
+            if name not in MLX_MODELS:
+                raise RuntimeError(f"no MLX build of model '{name}'")
+            print(f"[model] Downloading the Apple GPU copy of '{name}'…")
+            path = fetch_mlx_model(name, _data_dir())
+        print(f"[model] Loading '{name}' (Apple GPU / MLX)…")
+        t0 = time.time()
+        self.model = MlxWhisper(path)
+        self.engine = "mlx"
+        print(f"[model] Ready on Apple GPU (MLX) in {time.time() - t0:.1f}s.")
+        self.set_state("idle")
+
+    def _load_ct2_model(self):
         _register_cuda_dlls()
         from faster_whisper import WhisperModel
         device = self.cfg["device"]
-        compute = self.cfg["compute_type"]
+        if device == "mlx":  # MLX failed; run faster-whisper on the CPU
+            device = "cpu"
+        compute = self.cfg["compute_type"] if device == self.cfg["device"] else "int8"
         model_ref = _resolve_model(self.cfg["model"])
         bundled = os.path.isdir(model_ref)
         print(f"[model] Loading '{self.cfg['model']}' ({device}/{compute})… "
@@ -631,6 +689,7 @@ class WhisperType:
                 )
             else:
                 raise
+        self.engine = "ct2"
         print(f"[model] Ready on {device} in {time.time() - t0:.1f}s.")
         self.set_state("idle")
 
@@ -724,10 +783,30 @@ class WhisperType:
                 name="WhisperTypeAudioReader",
             )
             self._capture_thread.start()
+        self._streamer = None
+        if self.cfg.get("stream_transcription", True) and self.model is not None:
+            self._streamer = StreamingTranscriber(
+                get_audio=self._audio_so_far,
+                transcribe=self._transcribe_audio,
+                vad=silero_vad(0.7, self.cfg["sample_rate"]),
+                sample_rate=self.cfg["sample_rate"],
+            )
+            self._streamer.start()
         self.set_state("recording")
         if self.cfg.get("show_overlay", True):
             self.overlay.show("Listening")
         print("[rec] Recording… press the hotkey again to stop.")
+
+    def _audio_so_far(self):
+        frames = list(self.frames)  # the reader thread keeps appending
+        if not frames:
+            return np.zeros(0, dtype=np.float32)
+        return np.concatenate(frames, axis=0).flatten().astype(np.float32)
+
+    def _drop_streamer(self):
+        streamer, self._streamer = self._streamer, None
+        if streamer is not None:
+            streamer.cancel()
 
     def stop_recording(self):
         self.recording = False
@@ -738,6 +817,7 @@ class WhisperType:
         finally:
             self.stream = None
         if not self.frames:
+            self._drop_streamer()
             self.overlay.hide()
             self.set_state("idle")
             return None
@@ -746,6 +826,7 @@ class WhisperType:
         print(f"[rec] Stopped ({secs:.1f}s).")
         if secs < self.cfg["min_seconds"]:
             print("[rec] Too short, ignoring.")
+            self._drop_streamer()
             self.overlay.hide()
             self.set_state("idle")
             return None
@@ -754,20 +835,31 @@ class WhisperType:
         return audio
 
     # -- transcription ------------------------------------------------------
-    def transcribe_and_output(self, audio):
-        self.set_state("working")
-        print("[stt] Transcribing…")
-        t0 = time.time()
-        text = ""
-        try:
+    def _transcribe_audio(self, audio, prompt=None):
+        """Transcribe one stretch of audio; safe to call from any thread."""
+        with self._model_lock:
+            if getattr(self, "engine", "ct2") == "mlx":
+                return self.model.transcribe(audio, self.cfg["language"], prompt)
             segments, _ = self.model.transcribe(
                 audio,
                 language=self.cfg["language"],
                 vad_filter=True,
                 beam_size=5,
+                initial_prompt=prompt,
             )
-            text = "".join(s.text for s in segments).strip()
-            print(f"[stt] {time.time() - t0:.1f}s → {text!r}")
+            return "".join(s.text for s in segments).strip()
+
+    def transcribe_and_output(self, audio, streamer=None):
+        self.set_state("working")
+        print("[stt] Transcribing…")
+        t0 = time.time()
+        text = ""
+        try:
+            if streamer is not None:
+                text = streamer.finish(audio)
+            else:
+                text = self._transcribe_audio(audio)
+            print(f"[stt] {time.time() - t0:.1f}s after stop → {text!r}")
         except Exception as e:
             import traceback
 
@@ -818,10 +910,11 @@ class WhisperType:
                     self.start_recording()
                 else:
                     audio = self.stop_recording()
+                    streamer, self._streamer = self._streamer, None
                     if audio is not None:
                         threading.Thread(
                             target=self.transcribe_and_output,
-                            args=(audio,),
+                            args=(audio, streamer),
                             daemon=True,
                             name="WhisperTypeTranscription",
                         ).start()
@@ -1003,12 +1096,16 @@ class WhisperType:
             ).grid(row=2, column=0, columnspan=2, sticky="w", pady=(2, 10))
 
             # --- Speech model ---
-            installed = _local_models()
+            # Install status follows the current engine: the Apple GPU (MLX)
+            # keeps its own copy of each model.
+            on_mlx = self.cfg["device"] == "mlx"
+            installed = _local_mlx_models() if on_mlx else _local_models()
+            sizes = MLX_MODELS if on_mlx else MODELS
 
             def model_label(name):
                 note = MODEL_NOTES.get(name, "")
                 status = ("installed" if name in installed
-                          else f"download {_human_mb(MODELS[name][1])}")
+                          else f"download {_human_mb(sizes[name][1])}")
                 return f"{name} — {note} ({status})"
 
             model_names = list(MODELS)
@@ -1024,10 +1121,16 @@ class WhisperType:
 
             # --- Acceleration ---
             if IS_MACOS:
-                gpu_label = None
-                cpu_label = "CPU — supported on macOS"
-                accel_values = [cpu_label]
-                accel_value = cpu_label
+                cpu_label = "CPU — works on every Mac, slower"
+                if mlx_supported():
+                    gpu_label = "GPU — Apple silicon (MLX), about 10× faster"
+                    accel_values = [gpu_label, cpu_label]
+                    accel_value = (gpu_label if self.cfg["device"] == "mlx"
+                                   else cpu_label)
+                else:
+                    gpu_label = None
+                    accel_values = [cpu_label]
+                    accel_value = cpu_label
             else:
                 gpu_ready = cuda_installed()
                 gpu_label = ("GPU — NVIDIA (installed)" if gpu_ready
@@ -1057,12 +1160,21 @@ class WhisperType:
             ttk.Entry(frm, textvariable=lang_var, width=28).grid(
                 row=10, column=0, columnspan=2, sticky="we", pady=(2, 10))
 
-            # --- Overlay ---
+            # --- Overlay and streaming (one row, so later rows keep their place) ---
+            toggles = ttk.Frame(frm)
+            toggles.grid(row=11, column=0, columnspan=2, sticky="w", pady=(0, 8))
             overlay_var = tk.BooleanVar(value=self.cfg.get("show_overlay", True))
             ttk.Checkbutton(
-                frm, text="Show waveform overlay while recording",
+                toggles, text="Show waveform overlay while recording",
                 variable=overlay_var,
-            ).grid(row=11, column=0, columnspan=2, sticky="w", pady=(0, 8))
+            ).grid(row=0, column=0, sticky="w")
+            stream_var = tk.BooleanVar(
+                value=self.cfg.get("stream_transcription", True))
+            ttk.Checkbutton(
+                toggles,
+                text="Transcribe while I speak (shorter wait after stopping)",
+                variable=stream_var,
+            ).grid(row=1, column=0, sticky="w", pady=(4, 0))
 
             # --- Download progress (only shown when something must be fetched) ---
             prog_label = ttk.Label(frm, text="", foreground="#555")
@@ -1094,16 +1206,24 @@ class WhisperType:
                 self.cfg["output_mode"] = output_var.get()
                 self.cfg["language"] = lang_var.get().strip() or "en"
                 self.cfg["show_overlay"] = bool(overlay_var.get())
+                self.cfg["stream_transcription"] = bool(stream_var.get())
                 if not self.cfg["show_overlay"]:
                     self.overlay.hide()
 
                 # Model / acceleration may require a download before they apply.
                 new_model = model_names[labels.index(model_var.get())]
-                want_cuda = bool(gpu_label and accel_var.get() == gpu_label)
+                want_gpu = bool(gpu_label and accel_var.get() == gpu_label)
+                want_cuda = want_gpu and not IS_MACOS
+                want_mlx = want_gpu and IS_MACOS
+                new_device = "mlx" if want_mlx else ("cuda" if want_cuda else "cpu")
                 model_changed = new_model != self.cfg["model"]
-                device_changed = want_cuda != (self.cfg["device"] == "cuda")
-                needs_dl = (new_model not in _local_models()
-                            or (want_cuda and not cuda_installed()))
+                device_changed = new_device != self.cfg["device"]
+                if want_mlx:
+                    # The Apple GPU uses its own copy of each model.
+                    needs_dl = new_model not in _local_mlx_models()
+                else:
+                    needs_dl = (new_model not in _local_models()
+                                or (want_cuda and not cuda_installed()))
 
                 if not (model_changed or device_changed):
                     self.save_config()
@@ -1114,7 +1234,10 @@ class WhisperType:
 
                 def apply_choice():
                     self.cfg["model"] = new_model
-                    if want_cuda:
+                    if want_mlx:
+                        self.cfg["device"] = "mlx"
+                        self.cfg["compute_type"] = "float16"
+                    elif want_cuda:
                         self.cfg["device"] = "cuda"
                         self.cfg["compute_type"] = "float16"
                     else:
@@ -1152,6 +1275,7 @@ class WhisperType:
                     try:
                         ensure_components(
                             model=new_model, want_cuda=want_cuda,
+                            want_mlx=want_mlx,
                             on_status=set_status, on_progress=set_progress)
                     except Exception as e:
                         import traceback
@@ -1493,7 +1617,8 @@ def _verify_model(path, name):
             f"to load")
 
 
-def ensure_components(model=None, want_cuda=False, on_status=None, on_progress=None):
+def ensure_components(model=None, want_cuda=False, want_mlx=False,
+                      on_status=None, on_progress=None):
     """Download whatever is missing for the requested setup.
 
     on_status(text) and on_progress(done_mb, total_mb) let a GUI show what is
@@ -1509,21 +1634,41 @@ def ensure_components(model=None, want_cuda=False, on_status=None, on_progress=N
     jobs = []
     if want_cuda and not cuda_installed():
         jobs.append(("cuda", os.path.join(dest, "nvidia"), CUDA_MB))
-    if model and model not in _local_models():
+    if model and want_mlx:
+        # The Apple GPU path needs only its MLX copy; the CTranslate2 model is
+        # fetched later only if MLX ever has to fall back to the CPU.
+        if model not in _local_mlx_models():
+            if model not in MLX_MODELS:
+                raise ValueError(f"no Apple GPU build of model '{model}'")
+            jobs.append((f"mlx:{model}", os.path.join(dest, MLX_DIRNAME),
+                         MLX_MODELS[model][1]))
+    elif model and model not in _local_models():
         if model not in MODELS:
             raise ValueError(f"unknown model '{model}'")
         jobs.append((model, os.path.join(dest, "models", model), MODELS[model][1]))
 
     for kind, path, total_mb in jobs:
-        label = "GPU acceleration files" if kind == "cuda" else f"model '{kind}'"
+        if kind == "cuda":
+            label = "GPU acceleration files"
+        elif kind.startswith("mlx:"):
+            label = f"Apple GPU model '{kind[4:]}'"
+        else:
+            label = f"model '{kind}'"
         status(f"Downloading {label} ({_human_mb(total_mb)})…")
         stop = threading.Event()
 
-        def watch(p=path, t=total_mb):
+        def size_mb(p):
+            return _dir_size_mb(p) if os.path.isdir(p) else 0
+
+        # Count only what this download adds: the MLX folder already holds
+        # any other installed GPU models.
+        baseline = size_mb(path)
+
+        def watch(p=path, t=total_mb, base=baseline):
             while not stop.wait(0.5):
                 if on_progress:
                     try:
-                        on_progress(_dir_size_mb(p) if os.path.isdir(p) else 0, t)
+                        on_progress(max(0, size_mb(p) - base), t)
                     except Exception:
                         pass
 
@@ -1532,6 +1677,8 @@ def ensure_components(model=None, want_cuda=False, on_status=None, on_progress=N
         try:
             if kind == "cuda":
                 fetch_cuda(dest)
+            elif kind.startswith("mlx:"):
+                fetch_mlx_model(kind[4:], dest)
             else:
                 fetch_model(kind, dest)
         finally:
@@ -1731,6 +1878,14 @@ def check():
         import numpy
         print(f"numpy    : {numpy.__version__}")
         print(f"models known: {list(MODELS)}")
+        if IS_MACOS:
+            print(f"apple gpu: {'mlx ok' if mlx_supported() else 'unavailable'}")
+            if mlx_supported():
+                from mlx_backend import _stub_word_timestamps
+                _stub_word_timestamps()
+                import mlx_whisper  # noqa: F401
+                import mlx.core as mx
+                print(f"mlx      : {mx.__version__} on {mx.default_device()}")
         print("CHECK OK")
         return 0
     except Exception:
@@ -1744,9 +1899,11 @@ def main():
     # (faster-whisper's resource tracker); without this each helper launches
     # another full copy of WhisperType.
     multiprocessing.freeze_support()
-    if IS_MACOS and getattr(sys, "frozen", False) and not sys.stdout.isatty():
+    cli_mode = any(arg.startswith("--") for arg in sys.argv[1:])
+    if IS_MACOS and getattr(sys, "frozen", False) and not cli_mode \
+            and not sys.stdout.isatty():
         # A Finder-launched app has nowhere to print; keep a log users (and
-        # bug reports) can find.
+        # bug reports) can find. CLI modes (--check, used by CI) keep stdout.
         try:
             log_path = os.path.expanduser("~/Library/Logs/WhisperType.log")
             log = open(log_path, "a", buffering=1, encoding="utf-8")

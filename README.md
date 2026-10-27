@@ -84,6 +84,12 @@ Prefer to build it yourself, or run without installing? See
    while your speech is transcribed locally, then the text is **pasted into
    whatever app is focused** (or copied to the clipboard).
 
+While you speak, WhisperType already transcribes in the background at each
+natural pause, on Windows and macOS alike. When you stop, only the words since
+your last pause are left to transcribe, so the wait stays short however long
+you dictate. Turn this off in Settings ("Transcribe while I speak") to
+transcribe everything in one pass after you stop.
+
 The overlay never takes keyboard focus and is click-through, so it can't
 interfere with the app you're typing into. Turn it off from the tray menu or
 Settings if you'd rather just have the tray dot.
@@ -109,9 +115,12 @@ Right-click the tray icon for:
     `large-v3`. Each entry shows whether it is installed or how large the
     download is; picking one that isn't installed downloads it with a progress
     bar and then swaps to it **without restarting the app**.
-  - **Acceleration** — GPU (NVIDIA) or CPU on Windows; CPU on macOS. Choosing
-    GPU on Windows when the CUDA libraries aren't present downloads those too.
-  - Output mode, language, and whether to show the waveform overlay
+  - **Acceleration** — GPU (NVIDIA) or CPU on Windows; GPU (Apple silicon,
+    via MLX) or CPU on macOS. Choosing GPU on Windows when the CUDA libraries
+    aren't present downloads those too; on macOS it downloads the GPU copy of
+    the chosen model.
+  - Output mode, language, whether to show the waveform overlay, and whether
+    to transcribe while you speak
 
   So if a model turns out to be too slow, or GPU was chosen on a machine with no
   NVIDIA card, it can be changed here instead of reinstalling. Settings are
