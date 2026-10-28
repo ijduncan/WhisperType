@@ -12,10 +12,12 @@ CTranslate2 models under ``models-mlx/<name>``.
 from __future__ import annotations
 
 import importlib.util
+import json
 import os
 import platform
 import sys
 import types
+from functools import cached_property
 
 import numpy as np
 
@@ -136,6 +138,25 @@ class MlxWhisper:
         # second of silence so the first dictation isn't slowed by loading.
         self._decode(np.zeros(16000, dtype=np.float32), language="en")
 
+    @cached_property
+    def _prompt_tokenizer(self):
+        from mlx_whisper.tokenizer import get_tokenizer
+
+        # Match the loaded model's English/multilingual vocabulary without
+        # loading a second copy of its weights or fetching any tokenizer.
+        with open(os.path.join(self.model_dir, "config.json"), encoding="utf-8") as f:
+            n_vocab = json.load(f)["n_vocab"]
+        multilingual = n_vocab >= 51865
+        return get_tokenizer(
+            multilingual,
+            num_languages=n_vocab - 51765 - int(multilingual),
+            language="en", task="transcribe",
+        )
+
+    def encode_prompt(self, text: str) -> list[int]:
+        """Count prompt tokens exactly as mlx-whisper's initial_prompt does."""
+        return self._prompt_tokenizer.encode(" " + text.strip())
+
     def _decode(
         self, audio: np.ndarray, language: str | None, prompt: str | None = None
     ) -> str:
@@ -154,7 +175,7 @@ class MlxWhisper:
     def transcribe(
         self, audio: np.ndarray, language: str | None, prompt: str | None = None
     ) -> str:
-        """``prompt``: preceding text, for consistent style across pieces."""
+        """``prompt``: style/vocabulary examples and preceding dictation text."""
         speech = trim_to_speech(np.asarray(audio, dtype=np.float32))
         if speech.size < 1600:  # under 0.1 s of speech
             return ""

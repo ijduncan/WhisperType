@@ -121,10 +121,28 @@ Right-click the tray icon for:
     the chosen model.
   - Output mode, language, whether to show the waveform overlay, and whether
     to transcribe while you speak
+  - **Dictation style prompt** — an editable example of the punctuation,
+    capitalization, names, and terminology you want Whisper to use. A short
+    punctuated English example is included by default. Use **Clear** to disable
+    it, or **Use punctuation example** to restore it.
 
   So if a model turns out to be too slow, or GPU was chosen on a machine with no
   NVIDIA card, it can be changed here instead of reinstalling. Settings are
   saved to `config.json`.
+
+The dictation prompt runs locally in the existing speech model, including
+while streaming. It works best as a short example of the desired writing style
+or a list of correctly spelled names, in the language you are dictating:
+
+> Hello, how are you? I'm doing well. Let's review the details, make a decision,
+> and move forward.
+
+Whisper treats this as context rather than an instruction to rewrite speech.
+It can encourage punctuation and spelling, but does not guarantee removal of
+fillers or correction of grammar. The prompt and recent dictation share
+Whisper's small context window; longer examples are shortened to leave room
+for streaming context. This adds no model download or cloud processing. See
+the [Whisper prompting guide](https://developers.openai.com/cookbook/examples/whisper_prompting_guide).
 
 ## Running from source
 
@@ -273,6 +291,8 @@ Edit **`config.json`** (created on first run):
 | `compute_type` | Windows: `float16`; macOS: `int8` | `float16` on GPU; `int8` on CPU. |
 | `output_mode`  | `paste`            | `paste` into focused app, or `clipboard` only. |
 | `show_overlay` | `true`             | Live waveform panel while recording. |
+| `stream_transcription` | `true` | Transcribe at pauses while recording to shorten the wait after stopping. |
+| `transcription_prompt` | Short punctuated English example | Style/vocabulary context for both engines. Set to `""` to disable. |
 
 You can also toggle auto-paste from the tray icon's right-click menu.
 

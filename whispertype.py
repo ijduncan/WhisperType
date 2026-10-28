@@ -22,6 +22,11 @@ import pystray
 from PIL import Image, ImageDraw
 
 from streaming import StreamingTranscriber, silero_vad
+from transcription_prompt import (
+    DEFAULT_TRANSCRIPTION_PROMPT,
+    build_transcription_prompt,
+    normalize_transcription_prompt,
+)
 from mlx_backend import (
     MLX_DIRNAME,
     MLX_MODELS,
@@ -205,6 +210,7 @@ DEFAULT_CONFIG = {
     "sample_rate": 16000,          # Whisper expects 16 kHz
     "min_seconds": 0.3,            # ignore recordings shorter than this
     "stream_transcription": True,  # transcribe at pauses while still recording
+    "transcription_prompt": DEFAULT_TRANSCRIPTION_PROMPT,
 }
 
 
@@ -229,6 +235,9 @@ def load_config():
     # load on every launch.
     if IS_MACOS and cfg.get("device") not in ("cpu", "mlx"):
         cfg["device"], cfg["compute_type"] = "cpu", "int8"
+    cfg["transcription_prompt"] = normalize_transcription_prompt(
+        cfg["transcription_prompt"]
+    )
     try:
         configured_hotkey = str(cfg.get("hotkey", default_hotkey()))
         if IS_WINDOWS:
@@ -838,14 +847,26 @@ class WhisperType:
     def _transcribe_audio(self, audio, prompt=None):
         """Transcribe one stretch of audio; safe to call from any thread."""
         with self._model_lock:
+            style = self.cfg.get("transcription_prompt", DEFAULT_TRANSCRIPTION_PROMPT)
             if getattr(self, "engine", "ct2") == "mlx":
-                return self.model.transcribe(audio, self.cfg["language"], prompt)
+                initial_prompt = build_transcription_prompt(
+                    style, prompt, self.model.encode_prompt
+                )
+                return self.model.transcribe(
+                    audio, self.cfg["language"], initial_prompt
+                )
+            initial_prompt = build_transcription_prompt(
+                style, prompt,
+                lambda text: self.model.hf_tokenizer.encode(
+                    " " + text.strip(), add_special_tokens=False
+                ).ids,
+            )
             segments, _ = self.model.transcribe(
                 audio,
                 language=self.cfg["language"],
                 vad_filter=True,
                 beam_size=5,
-                initial_prompt=prompt,
+                initial_prompt=initial_prompt,
             )
             return "".join(s.text for s in segments).strip()
 
@@ -1039,7 +1060,7 @@ class WhisperType:
     def _run_settings_window(self):
         """Builds the settings window. Must run on the shared UI thread."""
         import tkinter as tk
-        from tkinter import ttk, messagebox
+        from tkinter import ttk, messagebox, scrolledtext
 
         try:
             root = tk.Toplevel(self.ui.root)
@@ -1176,13 +1197,49 @@ class WhisperType:
                 variable=stream_var,
             ).grid(row=1, column=0, sticky="w", pady=(4, 0))
 
+            # Whisper follows examples and vocabulary rather than rewrite
+            # instructions. Keep the prompt editable and easy to turn off.
+            ttk.Label(frm, text="Dictation style prompt (optional)").grid(
+                row=12, column=0, columnspan=2, sticky="w", pady=(2, 0))
+            prompt_entry = scrolledtext.ScrolledText(
+                frm, width=50, height=4, wrap="word", font="TkDefaultFont",
+            )
+            prompt_entry.insert(
+                "1.0", self.cfg.get("transcription_prompt", DEFAULT_TRANSCRIPTION_PROMPT)
+            )
+            prompt_entry.grid(
+                row=13, column=0, columnspan=2, sticky="we", pady=(2, 4))
+            ttk.Label(
+                frm,
+                text=("Use example text, names, or terms in your dictation language.\n"
+                      "Guides punctuation and spelling; doesn't rewrite speech.\n"
+                      "Clear to turn off."),
+                foreground="#777",
+                wraplength=380,
+            ).grid(row=14, column=0, columnspan=2, sticky="w")
+
+            def replace_prompt(text):
+                prompt_entry.delete("1.0", "end")
+                prompt_entry.insert("1.0", text)
+
+            prompt_buttons = ttk.Frame(frm)
+            prompt_buttons.grid(
+                row=15, column=0, columnspan=2, sticky="e", pady=(4, 8))
+            ttk.Button(
+                prompt_buttons, text="Use punctuation example",
+                command=lambda: replace_prompt(DEFAULT_TRANSCRIPTION_PROMPT),
+            ).grid(row=0, column=0, padx=(0, 8))
+            ttk.Button(
+                prompt_buttons, text="Clear", command=lambda: replace_prompt(""),
+            ).grid(row=0, column=1)
+
             # --- Download progress (only shown when something must be fetched) ---
             prog_label = ttk.Label(frm, text="", foreground="#555")
             prog_bar = ttk.Progressbar(frm, mode="determinate", maximum=100)
 
             # --- Buttons ---
             btns = ttk.Frame(frm)
-            btns.grid(row=14, column=0, columnspan=2, sticky="e", pady=(6, 0))
+            btns.grid(row=18, column=0, columnspan=2, sticky="e", pady=(6, 0))
 
             def on_save():
                 requested_hotkey = hotkey_var.get().strip().lower()
@@ -1207,6 +1264,9 @@ class WhisperType:
                 self.cfg["language"] = lang_var.get().strip() or "en"
                 self.cfg["show_overlay"] = bool(overlay_var.get())
                 self.cfg["stream_transcription"] = bool(stream_var.get())
+                self.cfg["transcription_prompt"] = normalize_transcription_prompt(
+                    prompt_entry.get("1.0", "end-1c")
+                )
                 if not self.cfg["show_overlay"]:
                     self.overlay.hide()
 
@@ -1256,8 +1316,8 @@ class WhisperType:
                 # Download first, keeping the window open with progress.
                 save_btn.config(state="disabled")
                 cancel_btn.config(state="disabled")
-                prog_label.grid(row=12, column=0, columnspan=2, sticky="w")
-                prog_bar.grid(row=13, column=0, columnspan=2, sticky="we", pady=(4, 0))
+                prog_label.grid(row=16, column=0, columnspan=2, sticky="w")
+                prog_bar.grid(row=17, column=0, columnspan=2, sticky="we", pady=(4, 0))
 
                 base_text = {"msg": "Preparing…"}
 
