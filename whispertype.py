@@ -22,6 +22,7 @@ import pystray
 from PIL import Image, ImageDraw
 
 from streaming import StreamingTranscriber, silero_vad
+from single_instance import SingleInstance
 from transcription_prompt import (
     DEFAULT_TRANSCRIPTION_PROMPT,
     build_transcription_prompt,
@@ -1984,8 +1985,17 @@ def main():
     if "--selftest" in sys.argv:
         selftest()
         return
-    cfg = load_config()
-    WhisperType(cfg).run()
+    # Source launches and installed builds share one per-user lock. Otherwise
+    # every copy hears the same hotkey and pastes its own transcript.
+    instance = SingleInstance(os.path.join(user_data_dir(), "instance.lock"))
+    if not instance.acquire():
+        print("[startup] WhisperType is already running; use its tray/menu-bar icon.")
+        return
+    try:
+        cfg = load_config()
+        WhisperType(cfg).run()
+    finally:
+        instance.release()
 
 
 if __name__ == "__main__":

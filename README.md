@@ -84,6 +84,10 @@ Prefer to build it yourself, or run without installing? See
    while your speech is transcribed locally, then the text is **pasted into
    whatever app is focused** (or copied to the clipboard).
 
+Only one copy of WhisperType runs per user. Opening it again keeps the existing
+tray/menu-bar app running, so two copies cannot record and paste the same
+dictation twice.
+
 While you speak, WhisperType already transcribes in the background at each
 natural pause, on Windows and macOS alike. When you stop, only the words since
 your last pause are left to transcribe, so the wait stays short however long
