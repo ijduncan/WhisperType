@@ -2,7 +2,7 @@ import unittest
 
 import numpy as np
 
-from streaming import StreamingTranscriber
+from streaming import StreamingTranscriber, finish_sentence, join_piece
 
 SR = 16000
 
@@ -73,7 +73,7 @@ class StreamingTests(unittest.TestCase):
         rec.advance_to(9.0)
         text = streamer.finish(rec.audio())
         self.assertEqual(calls[-1], (6.0, "piece1"))
-        self.assertEqual(text, "piece1 piece2")
+        self.assertEqual(text, "piece1 piece2.")
 
     def test_leading_silence_is_dropped_not_rescanned(self):
         rec, streamer, calls = self.make([])
@@ -105,6 +105,40 @@ class StreamingTests(unittest.TestCase):
         self.assertEqual(streamer._committed, 0)  # nothing lost
         streamer._transcribe = lambda audio, prompt: "all of it"
         self.assertEqual(streamer.finish(rec.audio()), "all of it")
+
+    def test_prompt_leaves_off_a_full_stop_the_cut_may_have_added(self):
+        rec, streamer, calls = self.make([(0.5, 3.0), (4.0, 9.0)])
+        streamer._transcribe = lambda audio, prompt: calls.append(prompt) or "And provide."
+        rec.advance_to(6.0)
+        streamer.step()
+        streamer.finish(rec.audio())
+        self.assertEqual(calls[-1], "And provide")
+
+
+class JunctionTests(unittest.TestCase):
+    def test_lowercase_continuation_drops_the_cut_full_stop(self):
+        self.assertEqual(
+            join_piece("Scan the New Regency.", "video files and provide."),
+            "Scan the New Regency video files and provide.",
+        )
+
+    def test_capital_keeps_or_adds_the_full_stop(self):
+        self.assertEqual(join_piece("It ends here.", "Then more."), "It ends here. Then more.")
+        self.assertEqual(join_piece("until the end", "That is all."), "until the end. That is all.")
+
+    def test_question_mark_is_kept_and_followed_by_a_capital(self):
+        self.assertEqual(join_piece("Can we stream?", "so it starts"), "Can we stream? So it starts")
+
+    def test_pronoun_i_does_not_start_a_sentence(self):
+        self.assertEqual(join_piece("and then", "I left."), "and then I left.")
+
+    def test_ellipses_at_the_cut_are_removed(self):
+        self.assertEqual(join_piece("we could scan maybe...", "...the 50 most"), "we could scan maybe the 50 most")
+        self.assertEqual(finish_sentence("all the way..."), "all the way.")
+
+    def test_finish_sentence_adds_a_full_stop_only_when_missing(self):
+        self.assertEqual(finish_sentence("run it"), "run it.")
+        self.assertEqual(finish_sentence("run it?"), "run it?")
 
 
 if __name__ == "__main__":

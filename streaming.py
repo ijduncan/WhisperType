@@ -8,10 +8,18 @@ longer grows with the length of the dictation.
 
 Each piece is given the text so far as Whisper's prompt, which keeps
 punctuation and capitalisation consistent across the cuts.
+
+Whisper treats the end of its audio as the end of what was said, so a piece
+cut at a mid-sentence pause comes back as a finished sentence ("and provide.")
+and the next would start with a capital. To undo that, the prompt leaves off
+the full stop a cut may have added. Whisper then starts the next piece in
+lowercase if it carries on the sentence, and the full stop is dropped; a
+capital means a new sentence, and the full stop stays.
 """
 
 from __future__ import annotations
 
+import re
 import threading
 import time
 from typing import Callable, List, Optional
@@ -69,7 +77,8 @@ class StreamingTranscriber:
         self._min_piece = int(min_piece_s * sample_rate)
         self._prompt_chars = prompt_chars
         self._committed = 0  # samples already transcribed (or dropped as silence)
-        self._parts: List[str] = []
+        self._text = ""
+        self._pieces = 0
         self._stop = threading.Event()
         self._thread: Optional[threading.Thread] = None
         self._error: Optional[BaseException] = None
@@ -101,13 +110,14 @@ class StreamingTranscriber:
             text = self._transcribe(tail, self._prompt())
             print(f"[stream] last piece {tail.size / self._sr:.1f}s "
                   f"→ {time.time() - t0:.1f}s")
-            if text:
-                self._parts.append(text)
+            self._add(text)
+        if self._pieces > 1:
+            self._text = finish_sentence(self._text)
         return self.text
 
     @property
     def text(self) -> str:
-        return " ".join(p.strip() for p in self._parts if p.strip())
+        return self._text
 
     # -- background loop -----------------------------------------------------
     def _run(self) -> None:
@@ -144,12 +154,51 @@ class StreamingTranscriber:
         piece = pending[:cut]
         t0 = time.time()
         text = self._transcribe(piece, self._prompt())
-        print(f"[stream] piece {len(self._parts) + 1}: {piece.size / self._sr:.1f}s "
+        print(f"[stream] piece {self._pieces + 1}: {piece.size / self._sr:.1f}s "
               f"→ {time.time() - t0:.1f}s {text!r}")
-        if text:
-            self._parts.append(text)
+        self._add(text)
         self._committed += cut
 
+    def _add(self, text: str) -> None:
+        if text and text.strip():
+            self._text = join_piece(self._text, text)
+            self._pieces += 1
+
     def _prompt(self) -> Optional[str]:
-        text = self.text
+        text = _CUT_STOP.sub("", self._text)
         return text[-self._prompt_chars:] if text else None
+
+
+# A full stop or ellipsis that may only be there because the audio was cut.
+_CUT_STOP = re.compile(r"(\.\.\.|…|\.)$")
+_LEADING_ELLIPSIS = re.compile(r"^(\.\.\.|…)\s*")
+# Capitalised whatever the sentence, so they don't show a new one started.
+_ALWAYS_CAPITAL = {"I", "I'm", "I'll", "I've", "I'd"}
+
+
+def join_piece(text: str, piece: str) -> str:
+    """Append a newly transcribed piece, fixing the punctuation at the cut."""
+    piece = _LEADING_ELLIPSIS.sub("", piece.strip())
+    if not text:
+        return piece
+    if not piece:
+        return text
+    first = piece.split()[0]
+    if piece[0].islower():
+        # Carries on the sentence: the full stop came from the cut.
+        text = _CUT_STOP.sub("", text)
+        if text.endswith(("?", "!")):
+            piece = piece[0].upper() + piece[1:]
+    elif piece[0].isupper() and first not in _ALWAYS_CAPITAL:
+        text = finish_sentence(text)
+    return f"{text} {piece}"
+
+
+def finish_sentence(text: str) -> str:
+    """End ``text`` with a full stop unless it already ends a sentence."""
+    text = text.rstrip()
+    if text.endswith(("...", "…")):
+        return _CUT_STOP.sub(".", text)
+    if text and text[-1].isalnum():
+        return text + "."
+    return text
